@@ -31,11 +31,9 @@ const userNamesCache = new Map();
 const configuredPlayfileDirs = new Set();
 const userSessionState = new Map();
 
-// === מנגנון yt-dlp + PO Token אוטומטי ללא קוקיז ===
+// === מנגנון yt-dlp יציב ללא תקיעות בהפעלה ===
 const YTDLP_BIN_PATH = path.join(os.tmpdir(), 'yt-dlp-linux');
 let ytdlpReadyPromise = null;
-let cachedPoTokenData = null;
-let lastPoTokenTime = 0;
 
 function normalizeMainExt(extVal) {
     const clean = String(extVal || '')
@@ -105,41 +103,15 @@ async function ensureYtDlpBinary() {
     return ytdlpReadyPromise;
 }
 
-async function getFreshPoToken() {
-    if (cachedPoTokenData && (Date.now() - lastPoTokenTime < 3600000)) {
-        return cachedPoTokenData;
-    }
-    try {
-        const { generate } = require('youtube-po-token-generator');
-        const tokenData = await generate();
-        if (tokenData && tokenData.poToken && tokenData.visitorData) {
-            cachedPoTokenData = tokenData;
-            lastPoTokenTime = Date.now();
-            console.log('[PO Token] Generated fresh PO Token & VisitorData successfully');
-            return tokenData;
-        }
-    } catch (err) {
-        console.warn('[PO Token] Generator warning:', err.message);
-    }
-    return null;
-}
-
 async function downloadWithYtDlpNoCookies(videoId, maxDurationSec = 900, perAttemptTimeoutMs = 15000) {
     const binPath = await ensureYtDlpBinary();
-    const poData = await getFreshPoToken();
-
     const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-    const clientStrategies = [];
-
-    if (poData && poData.poToken && poData.visitorData) {
-        clientStrategies.push(
-            `youtube:player_client=mweb,web;po_token=mweb.gvs+${poData.poToken},web.gvs+${poData.poToken};visitor_data=${poData.visitorData}`
-        );
-    }
-    clientStrategies.push(
-        'youtube:player_client=android_vr,ios,tv_embedded',
-        'youtube:player_client=tv,mweb'
-    );
+    
+    const clientStrategies = [
+        'youtube:player_client=android_vr,ios,mweb',
+        'youtube:player_client=tv_embedded,web',
+        'youtube:player_client=android,ios'
+    ];
 
     const uniquePrefix = `ytdlp_${videoId}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const outputTemplate = path.join(os.tmpdir(), `${uniquePrefix}.%(ext)s`);
@@ -176,7 +148,7 @@ async function downloadWithYtDlpNoCookies(videoId, maxDurationSec = 900, perAtte
 
             const found = findDownloadedFileByPrefix(uniquePrefix);
             if (found) {
-                console.log(`[yt-dlp Success] Downloaded ${found.size} bytes using ${extractorArg.slice(0, 48)}`);
+                console.log(`[yt-dlp Success] Downloaded ${found.size} bytes using ${extractorArg}`);
                 return {
                     filePath: found.filePath,
                     size: found.size,
@@ -185,7 +157,7 @@ async function downloadWithYtDlpNoCookies(videoId, maxDurationSec = 900, perAtte
             }
         } catch (err) {
             lastErr = err.message;
-            console.warn(`[yt-dlp Attempt Failed] (${extractorArg.slice(0, 35)}):`, lastErr.slice(0, 180));
+            console.warn(`[yt-dlp Attempt Failed] (${extractorArg}):`, lastErr.slice(0, 180));
             cleanupFilesByPrefix(uniquePrefix);
         }
     }
@@ -835,7 +807,7 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
 
 const MAIN_MENU_TEXT = 'ברוכים הבאים לחיפוש ביוטיוב! לשמיעת הפלייליסט שלכם הקישו 1 לשמיעת שיעורי התורה שלכם הקישו 2 לחיפוש מוזיקה חדש הקישו 3 לחיפוש שיעור חדש הקישו 4! שימו לב אם הסרטון ארוך מ 15 דקות הוא עולה בחלקים לשלוחת הפלייליסט או לשלוחת השיעורי תורה ! לחזרה לשלוחה הקודמת הקישו כוכבית! הקו מנוטר משתמש שיחפש תוכן לא ראוי יחסם ';
 
-app.get('/', (req, res) => { res.send('YouTube Personal Line Server v36.0 (Port Binding & Background Init Fix) OK'); });
+app.get('/', (req, res) => { res.send('YouTube Personal Line Server v37.0 Stable OK'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -1107,7 +1079,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         return res.send(`read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
 
     } catch (e) {
-        console.error('[General Error v36.0]', e.message);
+        console.error('[General Error v37.0]', e.message);
         if (!res.headersSent) {
             return res.send(`read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
         }
@@ -1116,11 +1088,10 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, '0.0.0.0', () => {
-    console.log(`=== Server v36.0 Ready on port ${port} ===`);
+    console.log(`=== Server v37.0 Ready on port ${port} ===`);
     setTimeout(async () => {
         try {
             await ensureYtDlpBinary();
-            await getFreshPoToken();
         } catch (e) {}
-    }, 1500);
+    }, 2000);
 });
