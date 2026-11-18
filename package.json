@@ -1,6 +1,6 @@
 {
   "name": "yemot-youtube-v34",
-  "version": "38.0.0",
+  "version": "40.0.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
