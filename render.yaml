@@ -22,3 +22,5 @@ services:
         sync: false
       - key: YEMOT_TOKEN
         sync: false
+      - key: YT_COOKIES
+        sync: false
