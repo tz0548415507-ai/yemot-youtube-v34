@@ -835,7 +835,7 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
 
 const MAIN_MENU_TEXT = 'ברוכים הבאים לחיפוש ביוטיוב! לשמיעת הפלייליסט שלכם הקישו 1 לשמיעת שיעורי התורה שלכם הקישו 2 לחיפוש מוזיקה חדש הקישו 3 לחיפוש שיעור חדש הקישו 4! שימו לב אם הסרטון ארוך מ 15 דקות הוא עולה בחלקים לשלוחת הפלייליסט או לשלוחת השיעורי תורה ! לחזרה לשלוחה הקודמת הקישו כוכבית! הקו מנוטר משתמש שיחפש תוכן לא ראוי יחסם ';
 
-app.get('/', (req, res) => { res.send('YouTube Personal Line Server v35.1 (yt-dlp + PO Token No Cookies) OK'); });
+app.get('/', (req, res) => { res.send('YouTube Personal Line Server v36.0 (Port Binding & Background Init Fix) OK'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -1107,7 +1107,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         return res.send(`read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
 
     } catch (e) {
-        console.error('[General Error v35.1]', e.message);
+        console.error('[General Error v36.0]', e.message);
         if (!res.headersSent) {
             return res.send(`read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
         }
@@ -1115,10 +1115,12 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, async () => {
-    console.log(`=== Server v35.1 Ready on port ${port} ===`);
-    try {
-        await ensureYtDlpBinary();
-        await getFreshPoToken();
-    } catch (e) {}
+app.listen(port, '0.0.0.0', () => {
+    console.log(`=== Server v36.0 Ready on port ${port} ===`);
+    setTimeout(async () => {
+        try {
+            await ensureYtDlpBinary();
+            await getFreshPoToken();
+        } catch (e) {}
+    }, 1500);
 });
