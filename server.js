@@ -31,7 +31,6 @@ const userNamesCache = new Map();
 const configuredPlayfileDirs = new Set();
 const userSessionState = new Map();
 
-// === מנגנון yt-dlp יציב ללא תקיעות בהפעלה ===
 const YTDLP_BIN_PATH = path.join(os.tmpdir(), 'yt-dlp-linux');
 let ytdlpReadyPromise = null;
 
@@ -103,14 +102,14 @@ async function ensureYtDlpBinary() {
     return ytdlpReadyPromise;
 }
 
-async function downloadWithYtDlpNoCookies(videoId, maxDurationSec = 900, perAttemptTimeoutMs = 15000) {
+async function downloadWithYtDlpNoCookies(videoId, maxDurationSec = 900, perAttemptTimeoutMs = 18000) {
     const binPath = await ensureYtDlpBinary();
     const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
     
     const clientStrategies = [
-        'youtube:player_client=android_vr,ios,mweb',
-        'youtube:player_client=tv_embedded,web',
-        'youtube:player_client=android,ios'
+        'youtube:player_client=android,web',
+        'youtube:player_client=ios,mweb',
+        'youtube:player_client=tv_embedded,android_vr'
     ];
 
     const uniquePrefix = `ytdlp_${videoId}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
@@ -126,7 +125,7 @@ async function downloadWithYtDlpNoCookies(videoId, maxDurationSec = 900, perAtte
                 '--no-cache-dir',
                 '--force-ipv4',
                 '--extractor-args', extractorArg,
-                '-f', 'bestaudio[ext=m4a][abr<=128]/bestaudio[abr<=96]/bestaudio/worst',
+                '-f', 'bestaudio[ext=m4a]/bestaudio/worst',
                 '--ffmpeg-location', ffmpegPath
             ];
 
@@ -172,11 +171,11 @@ async function downloadWithYtdlFallback(videoId, targetFilePath, maxBytes, timeo
         const st = ytdl(`https://www.youtube.com/watch?v=${videoId}`, {
             filter: 'audioonly',
             quality: 'lowestaudio',
-            playerClients: ['IOS', 'ANDROID', 'TV']
+            playerClients: ['ANDROID', 'IOS', 'WEB']
         });
         const tm = setTimeout(() => {
             try { st.destroy(); } catch (e) {}
-            ws.end(() => dl >= 30000 ? resolve(dl) : reject(new Error('ytdl fallback timeout')));
+            ws.end(() => dl >= 20000 ? resolve(dl) : reject(new Error('ytdl fallback timeout')));
         }, timeoutMs);
 
         st.on('data', c => {
@@ -190,11 +189,11 @@ async function downloadWithYtdlFallback(videoId, targetFilePath, maxBytes, timeo
         });
         st.on('end', () => {
             clearTimeout(tm);
-            ws.end(() => dl >= 30000 ? resolve(dl) : reject(new Error('ytdl fallback empty stream')));
+            ws.end(() => dl >= 20000 ? resolve(dl) : reject(new Error('ytdl fallback empty stream')));
         });
         st.on('error', e => {
             clearTimeout(tm);
-            ws.end(() => dl >= 250000 ? resolve(dl) : reject(e));
+            ws.end(() => dl >= 150000 ? resolve(dl) : reject(e));
         });
     });
 }
@@ -294,16 +293,13 @@ async function fetchYouTubeWithFallback(baseUrlWithoutKey, timeoutMs = 6500) {
             if (res.ok) {
                 const usedIdx = YT_KEYS.indexOf(key);
                 if (usedIdx !== -1 && usedIdx !== activeYtKeyIndex) {
-                    console.log(`[YouTube API] Switched active key to YOUTUBE_API_KEY${usedIdx === 0 ? '' : '2'}`);
                     activeYtKeyIndex = usedIdx;
                 }
                 return { res, data };
             }
-            console.warn(`[YouTube API Key #${YT_KEYS.indexOf(key) + 1} Quota/Error] HTTP ${res.status}:`, data?.error?.message || '');
             lastRes = res;
             lastData = data;
         } catch (err) {
-            console.warn(`[YouTube API Key #${YT_KEYS.indexOf(key) + 1} Fetch Error]:`, err.message);
             lastErr = err;
         }
     }
@@ -355,9 +351,7 @@ async function getUserNameIfRegistered(phone) {
                 return 'משתמש רשום';
             }
         }
-    } catch (e) {
-        console.warn('[Check User Warning]', e.message);
-    }
+    } catch (e) {}
     return null;
 }
 
@@ -390,9 +384,7 @@ async function ensurePlayfileExtension(folderPathStr, returnExt) {
         await uploadTextToExactPath(playfileIni, `ivr2:/${clean}/ext.ini`, 'ext.ini');
 
         configuredPlayfileDirs.add(cacheKey);
-    } catch (e) {
-        console.warn(`[Ensure Playfile ${clean}]`, e.message);
-    }
+    } catch (e) {}
 }
 
 async function getNextFileNumberStr(folder, reserveCount = 1) {
@@ -428,9 +420,7 @@ async function getNextFileNumberStr(folder, reserveCount = 1) {
                 }
             }
         }
-    } catch (e) {
-        console.warn(`[GetIVR2Dir] Warning checking ${folderPath}:`, e.message);
-    }
+    } catch (e) {}
 
     const baseNum = Math.max(maxExisting, 0);
     const startNum = baseNum + 1;
@@ -455,9 +445,7 @@ async function uploadWavBufferToExactPath(wavBuffer, exactTargetPath, fileNameLa
         body: formData
     }, timeoutMs);
 
-    const upText = await upRes.text();
-    console.log(`[Yemot Upload -> ${exactTargetPath}] (${wavBuffer.length} bytes) Response:`, upText.slice(0, 180));
-    return upText;
+    return await upRes.text();
 }
 
 async function saveAdminLogToExt8(callerPhone, userName, categoryLabel, searchQuery, downloadedTitle, statusText) {
@@ -480,9 +468,7 @@ async function saveAdminLogToExt8(callerPhone, userName, categoryLabel, searchQu
         ].join('\r\n') + '\r\n';
 
         await uploadTextToExactPath(txtDetails, `ivr2:/${ADMIN_LOG_EXT}/${nextNum}.txt`, `${nextNum}.txt`);
-    } catch (err) {
-        console.warn('[Admin Log Ext 8] Error:', err.message);
-    }
+    } catch (err) {}
 }
 
 async function downloadRecordingFromYemot(recordPath, apiDir) {
@@ -515,7 +501,6 @@ async function downloadRecordingFromYemot(recordPath, apiDir) {
             const headStr = buf.toString('utf8', 0, Math.min(buf.length, 150));
 
             if (buf.length > 200 && !headStr.includes('responseStatus') && !headStr.includes('EXCEPTION')) {
-                console.log(`[Yemot Download] Success from ${p} (${buf.length} bytes)`);
                 return buf;
             } else {
                 lastYemotResponse = headStr;
@@ -532,9 +517,7 @@ async function getFastGeminiModels() {
         'gemini-flash-lite-latest',
         'gemini-3.5-flash-lite',
         'gemini-3.5-flash',
-        'gemini-3.5-transcribe',
-        'gemini-flash-latest',
-        'gemini-3.6-flash'
+        'gemini-flash-latest'
     ];
     if (cachedModelName) {
         return [cachedModelName, ...defaultFastOrder.filter(m => m !== cachedModelName)];
@@ -546,20 +529,10 @@ async function getFastGeminiModels() {
             const available = (data.models || [])
                 .filter(m => (m.supportedGenerationMethods || []).includes('generateContent'))
                 .map(m => m.name.replace('models/', ''))
-                .filter(m => !m.includes('2.5') && !m.includes('1.5') && !m.includes('tts') && !m.includes('image') && !m.includes('robotics') && !m.includes('research') && !m.includes('computer-use'));
-
-            const matched = [];
-            for (const pref of defaultFastOrder) {
-                if (available.includes(pref)) matched.push(pref);
-            }
-            for (const m of available) {
-                if ((m.includes('flash') || m.includes('transcribe')) && !matched.includes(m)) {
-                    matched.push(m);
-                }
-            }
-            if (matched.length > 0) {
-                cachedModelName = matched[0];
-                return matched;
+                .filter(m => !m.includes('tts') && !m.includes('image'));
+            if (available.length > 0) {
+                cachedModelName = available[0];
+                return available;
             }
         }
     } catch (e) {}
@@ -568,7 +541,7 @@ async function getFastGeminiModels() {
 
 async function transcribeAudio(audioBase64) {
     const modelsToTry = await getFastGeminiModels();
-    const prompt = "תמלל את ההקלטה לעברית. החזר אך ורק את המילים שנאמרו בהקלטה ללא שום תוספת, ללא סימני פיסוק וללא הסברים.";
+    const prompt = "תמלל את ההקלטה לעברית. החזר אך ורק את המילים שנאמרו בהקלטה ללא שום תוספת.";
 
     let lastErr = '';
     for (const model of modelsToTry.slice(0, 4)) {
@@ -584,10 +557,7 @@ async function transcribeAudio(audioBase64) {
                             { inlineData: { mimeType: 'audio/wav', data: audioBase64 } }
                         ]
                     }],
-                    generationConfig: {
-                        temperature: 0.1,
-                        maxOutputTokens: 60
-                    }
+                    generationConfig: { temperature: 0.1, maxOutputTokens: 60 }
                 })
             }, 10000);
 
@@ -595,15 +565,11 @@ async function transcribeAudio(audioBase64) {
                 cachedModelName = model;
                 const data = await res.json();
                 const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-                console.log(`[Gemini] Model ${model} success:`, JSON.stringify(text));
                 return text;
             }
-
             lastErr = await res.text();
-            if (cachedModelName === model) cachedModelName = null;
         } catch (err) {
             lastErr = err.message;
-            if (cachedModelName === model) cachedModelName = null;
         }
     }
     throw new Error('GEMINI_ERR: ' + lastErr);
@@ -628,14 +594,8 @@ async function convertSegmentToWavFast(inputPath, outputWavPath, startSec = 0, d
             .audioChannels(1)
             .audioFrequency(8000)
             .outputOptions(['-threads 0'])
-            .on('end', () => {
-                clearTimeout(ffTimer);
-                resolve();
-            })
-            .on('error', (err) => {
-                clearTimeout(ffTimer);
-                reject(err);
-            })
+            .on('end', () => { clearTimeout(ffTimer); resolve(); })
+            .on('error', (err) => { clearTimeout(ffTimer); reject(err); })
             .save(outputWavPath);
     });
 }
@@ -654,11 +614,10 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
         let quickInputPath = null;
 
         try {
-            const dlRes = await downloadWithYtDlpNoCookies(videoId, firstChunkDuration, 14000);
+            const dlRes = await downloadWithYtDlpNoCookies(videoId, firstChunkDuration, 16000);
             quickInputPath = dlRes.filePath;
             quickCleanup = dlRes.cleanup;
         } catch (ytdlpErr) {
-            console.warn('[Part 1] yt-dlp failed, trying ytdl fallback:', ytdlpErr.message.slice(0, 160));
             await downloadWithYtdlFallback(videoId, tmpFallbackIn, 5.5 * 1024 * 1024, 10000);
             quickInputPath = tmpFallbackIn;
         }
@@ -670,9 +629,7 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
         fs.promises.unlink(tmpQuickWav).catch(() => null);
 
         const isFullFifteenMin = quickWavBuf.length >= 13800000;
-        const isLongStream = (durationSeconds > 900)
-            ? true
-            : (durationSeconds > 0 ? false : isFullFifteenMin);
+        const isLongStream = (durationSeconds > 900) ? true : (durationSeconds > 0 ? false : isFullFifteenMin);
 
         if (!isLongStream) {
             const singleNum = await getNextFileNumberStr(cleanLive, 1);
@@ -685,19 +642,13 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
                     const archNum = await getNextFileNumberStr(cleanArchive, 1);
                     const archTargetPath = `ivr2:/${cleanArchive}/${archNum}.wav`;
                     await uploadWavBufferToExactPath(quickWavBuf, archTargetPath, `${archNum}.wav`, 30000);
-                    quickWavBuf = null;
-                } catch (archErr) {
-                    quickWavBuf = null;
-                }
+                } catch (e) {}
             })();
 
             return `f-/${cleanLive}/${singleNum}`;
         }
 
-        const TOTAL_PARTS = durationSeconds > 900
-            ? Math.min(6, Math.max(2, Math.ceil((durationSeconds - 10) / 900)))
-            : 6;
-
+        const TOTAL_PARTS = durationSeconds > 900 ? Math.min(6, Math.max(2, Math.ceil((durationSeconds - 10) / 900))) : 6;
         const rawPartNums = await getNextFileNumberStr(cleanLive, TOTAL_PARTS);
         const partNums = Array.isArray(rawPartNums) ? rawPartNums : [rawPartNums];
         const partPaths = partNums.map(num => `ivr2:/${cleanLive}/${num}.wav`);
@@ -706,98 +657,7 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
 
         await uploadWavBufferToExactPath(quickWavBuf, partPaths[0], `${partNums[0]}.wav`, 20000);
 
-        (async () => {
-            const tmpFullFb = path.join(os.tmpdir(), `full_fb_${videoId}_${Date.now()}.webm`);
-            let fullCleanup = () => fs.promises.unlink(tmpFullFb).catch(() => null);
-            const validSegments = [];
-
-            try {
-                let fullInputPath = null;
-                try {
-                    const fullRes = await downloadWithYtDlpNoCookies(videoId, 0, 65000);
-                    fullInputPath = fullRes.filePath;
-                    fullCleanup = fullRes.cleanup;
-                } catch (fullYtdlpErr) {
-                    await downloadWithYtdlFallback(videoId, tmpFullFb, 48 * 1024 * 1024, 90000);
-                    fullInputPath = tmpFullFb;
-                }
-
-                const segments = [];
-                for (let idx = 0; idx < TOTAL_PARTS; idx++) {
-                    segments.push({ index: idx, start: idx * 900, duration: 900 });
-                }
-
-                for (const seg of segments) {
-                    const tmpPartWav = path.join(os.tmpdir(), `live_${seg.index}_${videoId}_${Date.now()}.wav`);
-                    try {
-                        await convertSegmentToWavFast(fullInputPath, tmpPartWav, seg.start, seg.duration);
-                        if (fs.existsSync(tmpPartWav)) {
-                            const stat = fs.statSync(tmpPartWav);
-                            if (stat.size > 1000) {
-                                validSegments.push(seg);
-                                if (seg.index > 0) {
-                                    const partBuf = await fs.promises.readFile(tmpPartWav);
-                                    await uploadWavBufferToExactPath(partBuf, partPaths[seg.index], `${partNums[seg.index]}.wav`, 45000);
-                                }
-                            } else {
-                                fs.promises.unlink(tmpPartWav).catch(() => null);
-                                break;
-                            }
-                        }
-                    } catch (segErr) {
-                        fs.promises.unlink(tmpPartWav).catch(() => null);
-                        break;
-                    }
-                    fs.promises.unlink(tmpPartWav).catch(() => null);
-                }
-
-                await ensurePlayfileExtension(cleanArchive, returnExt);
-
-                if (validSegments.length > 0) {
-                    const rawArchNums = await getNextFileNumberStr(cleanArchive, validSegments.length);
-                    const archNums = Array.isArray(rawArchNums) ? rawArchNums : [rawArchNums];
-                    const reversedSegments = [...validSegments].reverse();
-
-                    for (let i = 0; i < reversedSegments.length; i++) {
-                        const seg = reversedSegments[i];
-                        const archNum = archNums[i];
-                        const archTargetPath = `ivr2:/${cleanArchive}/${archNum}.wav`;
-                        const tmpArchWav = path.join(os.tmpdir(), `arch_${seg.index}_${videoId}_${Date.now()}.wav`);
-
-                        try {
-                            await convertSegmentToWavFast(fullInputPath, tmpArchWav, seg.start, seg.duration);
-                            if (fs.existsSync(tmpArchWav)) {
-                                const archBuf = await fs.promises.readFile(tmpArchWav);
-                                await uploadWavBufferToExactPath(archBuf, archTargetPath, `${archNum}.wav`, 45000);
-                                console.log(`[Reverse Archive] Uploaded Part ${seg.index + 1} -> ${archTargetPath}`);
-                            }
-                        } catch (archSegErr) {
-                            console.warn(`[Reverse Archive Part ${seg.index + 1} Error]:`, archSegErr.message);
-                        } finally {
-                            fs.promises.unlink(tmpArchWav).catch(() => null);
-                        }
-                    }
-                } else if (quickWavBuf) {
-                    const archNum = await getNextFileNumberStr(cleanArchive, 1);
-                    await uploadWavBufferToExactPath(quickWavBuf, `ivr2:/${cleanArchive}/${archNum}.wav`, `${archNum}.wav`, 35000);
-                }
-            } catch (bgErr) {
-                console.warn('[Background Full Video] Warning:', bgErr.message);
-                if (validSegments.length === 0 && quickWavBuf) {
-                    try {
-                        await ensurePlayfileExtension(cleanArchive, returnExt);
-                        const archNum = await getNextFileNumberStr(cleanArchive, 1);
-                        await uploadWavBufferToExactPath(quickWavBuf, `ivr2:/${cleanArchive}/${archNum}.wav`, `${archNum}.wav`, 35000);
-                    } catch (e) {}
-                }
-            } finally {
-                quickWavBuf = null;
-                fullCleanup();
-            }
-        })();
-
         return chainedPlayCommand;
-
     } catch (e) {
         quickCleanup();
         fs.promises.unlink(tmpQuickWav).catch(() => null);
@@ -805,15 +665,13 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
     }
 }
 
-const MAIN_MENU_TEXT = 'ברוכים הבאים לחיפוש ביוטיוב! לשמיעת הפלייליסט שלכם הקישו 1 לשמיעת שיעורי התורה שלכם הקישו 2 לחיפוש מוזיקה חדש הקישו 3 לחיפוש שיעור חדש הקישו 4! שימו לב אם הסרטון ארוך מ 15 דקות הוא עולה בחלקים לשלוחת הפלייליסט או לשלוחת השיעורי תורה ! לחזרה לשלוחה הקודמת הקישו כוכבית! הקו מנוטר משתמש שיחפש תוכן לא ראוי יחסם ';
+const MAIN_MENU_TEXT = 'ברוכים הבאים לחיפוש ביוטיוב! לשמיעת הפלייליסט שלכם הקישו 1 לשמיעת שיעורי התורה שלכם הקישו 2 לחיפוש מוזיקה חדש הקישו 3 לחיפוש שיעור חדש הקישו 4!';
 
-app.get('/', (req, res) => { res.send('YouTube Personal Line Server v37.0 Stable OK'); });
+app.get('/', (req, res) => { res.send('YouTube Personal Line Server v38.0 OK'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
     res.type('text/plain; charset=utf-8');
-
-    console.log('[Yemot Request]', JSON.stringify(q));
 
     try {
         const callerPhone = lastVal(q.ApiPhone).replace(/[^0-9]/g, '');
@@ -874,15 +732,8 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
                 const allResults = state.results || [];
                 const currentPage = state.pageIndex || 0;
                 const nextPage = ((currentPage + 1) * RESULTS_PER_PAGE < allResults.length) ? (currentPage + 1) : 0;
-
                 const nextPromptText = buildPagePromptText(state.cleanQuery, allResults, nextPage);
-                userSessionState.set(callerPhone, {
-                    ...state,
-                    pageIndex: nextPage,
-                    menuPromptText: nextPromptText,
-                    callId
-                });
-
+                userSessionState.set(callerPhone, { ...state, pageIndex: nextPage, menuPromptText: nextPromptText, callId });
                 return res.send(`read=t-${nextPromptText}=SelectResult,no,1,1,7,Digits,no`);
             }
 
@@ -909,13 +760,10 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 
             try {
                 const playCmd = await downloadAndPreparePlayback(chosenVideo.videoId, tempRecFolder, archiveFolder, chosenVideo.durationSeconds || 0, currentMainExt);
-                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, chosenVideo.title, `הורד בהצלחה (דף ${currentPage + 1} תוצאה ${digitNum}) לשלוחה ${archiveFolder}`);
+                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, chosenVideo.title, `הורד בהצלחה לשלוחה ${archiveFolder}`);
                 userSessionState.set(callerPhone, { step: 'WAIT_MENU', callId });
-
-                const durationPart = chosenVideo.durationText ? ` באורך ${chosenVideo.durationText}` : '';
-                return res.send(`id_list_message=t-משמיע ${chosenVideo.title}${durationPart}.${playCmd}&go_to_folder=${currentMainExt}`);
+                return res.send(`id_list_message=t-משמיע ${chosenVideo.title}.${playCmd}&go_to_folder=${currentMainExt}`);
             } catch (audioErr) {
-                console.error('[Download Error]', audioErr.message);
                 userSessionState.set(callerPhone, { step: 'WAIT_MENU', callId });
                 return res.send(`id_list_message=t-נמצא ${chosenVideo.title} אך אירעה שגיאה בטעינת הקובץ&read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
             }
@@ -946,12 +794,11 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             const cleanQuery = sanitizeForYemotTts(rawText, 55);
             if (!cleanQuery) {
                 userSessionState.set(callerPhone, { step: 'WAIT_MENU', callId });
-                return res.send(`id_list_message=t-לא הצלחתי לשמוע את הבקשה אנא נסו שנית&read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
+                return res.send(`id_list_message=t-לא הצלחתי לשמוע את הבקשה&read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
             }
 
             const ytBaseUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(cleanQuery)}&type=video&maxResults=28`;
-            let ytRes;
-            let ytData;
+            let ytRes, ytData;
             try {
                 const ytResult = await fetchYouTubeWithFallback(ytBaseUrl, 6500);
                 ytRes = ytResult.res;
@@ -959,11 +806,6 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             } catch (ytFetchErr) {
                 userSessionState.set(callerPhone, { step: 'WAIT_MENU', callId });
                 return res.send(`id_list_message=t-שגיאה בתקשורת עם יוטיוב&read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
-            }
-
-            if (!ytRes || !ytRes.ok) {
-                userSessionState.set(callerPhone, { step: 'WAIT_MENU', callId });
-                return res.send(`id_list_message=t-שגיאה במפתח החיפוש&read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
             }
 
             const validItems = (ytData.items || [])
@@ -976,46 +818,13 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
                 }));
 
             if (validItems.length === 0) {
-                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, '', 'לא נמצאו תוצאות ביוטיוב');
+                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, '', 'לא נמצאו תוצאות');
                 userSessionState.set(callerPhone, { step: 'WAIT_MENU', callId });
-                return res.send(`id_list_message=t-נקלט ${cleanQuery} לא נמצאו תוצאות ביוטיוב&read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
-            }
-
-            try {
-                const idsList = validItems.map(v => v.videoId).join(',');
-                const durBaseUrl = `https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id=${encodeURIComponent(idsList)}`;
-                const { res: durRes, data: durData } = await fetchYouTubeWithFallback(durBaseUrl, 5000);
-                if (durRes && durRes.ok) {
-                    const durMap = new Map();
-                    for (const vItem of (durData.items || [])) {
-                        if (vItem.id && vItem.contentDetails?.duration) {
-                            durMap.set(vItem.id, parseIsoDurationToHebrew(vItem.contentDetails.duration));
-                        }
-                    }
-                    for (const item of validItems) {
-                        const dInfo = durMap.get(item.videoId);
-                        if (dInfo) {
-                            item.durationSeconds = dInfo.seconds;
-                            item.durationText = dInfo.text;
-                        }
-                    }
-                }
-            } catch (durErr) {
-                console.warn('[YouTube Duration Fetch Warning]', durErr.message);
+                return res.send(`id_list_message=t-לא נמצאו תוצאות&read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
             }
 
             const menuPromptText = buildPagePromptText(cleanQuery, validItems, 0);
-
-            userSessionState.set(callerPhone, {
-                step: 'WAIT_SELECT_RESULT',
-                cleanQuery,
-                isMusic,
-                results: validItems,
-                pageIndex: 0,
-                menuPromptText,
-                callId
-            });
-
+            userSessionState.set(callerPhone, { step: 'WAIT_SELECT_RESULT', cleanQuery, isMusic, results: validItems, pageIndex: 0, menuPromptText, callId });
             return res.send(`read=t-${menuPromptText}=SelectResult,no,1,1,7,Digits,no`);
         }
 
@@ -1057,9 +866,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             }
 
             let rawName = '';
-            try {
-                rawName = await transcribeAudio(audioBuf.toString('base64'));
-            } catch (e) {}
+            try { rawName = await transcribeAudio(audioBuf.toString('base64')); } catch (e) {}
             const cleanName = sanitizeForYemotTts(rawName, 40) || 'משתמש רשום';
 
             await uploadWavBufferToExactPath(audioBuf, `ivr2:/${userFolder}/name.wav`, 'name.wav');
@@ -1068,7 +875,6 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 
             await ensurePlayfileExtension(musicExtFolder, currentMainExt);
             await ensurePlayfileExtension(torahExtFolder, currentMainExt);
-
             saveAdminLogToExt8(callerPhone, cleanName, 'רישום למערכת', 'הקלטת שם משתמש', '', 'נרשם בהצלחה');
 
             userSessionState.set(callerPhone, { step: 'WAIT_MENU', callId });
@@ -1079,7 +885,6 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         return res.send(`read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
 
     } catch (e) {
-        console.error('[General Error v37.0]', e.message);
         if (!res.headersSent) {
             return res.send(`read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
         }
@@ -1088,10 +893,8 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, '0.0.0.0', () => {
-    console.log(`=== Server v37.0 Ready on port ${port} ===`);
+    console.log(`=== Server v38.0 Ready on port ${port} ===`);
     setTimeout(async () => {
-        try {
-            await ensureYtDlpBinary();
-        } catch (e) {}
+        try { await ensureYtDlpBinary(); } catch (e) {}
     }, 2000);
 });
