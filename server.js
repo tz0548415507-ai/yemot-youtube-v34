@@ -32,7 +32,33 @@ const configuredPlayfileDirs = new Set();
 const userSessionState = new Map();
 
 const YTDLP_BIN_PATH = path.join(os.tmpdir(), 'yt-dlp-linux');
+const COOKIES_FILE_PATH = path.join(os.tmpdir(), 'yt_cookies.txt');
 let ytdlpReadyPromise = null;
+
+if (process.env.YT_COOKIES) {
+    try {
+        let cookieContent = process.env.YT_COOKIES.trim();
+        if (cookieContent.startsWith('[')) {
+            const parsed = JSON.parse(cookieContent);
+            let netscapeLines = ["# Netscape HTTP Cookie File"];
+            for (const c of parsed) {
+                const domain = c.domain || '.youtube.com';
+                const flag = domain.startsWith('.') ? "TRUE" : "FALSE";
+                const path = c.path || '/';
+                const secure = c.secure ? "TRUE" : "FALSE";
+                const expiration = c.expirationDate ? Math.floor(c.expirationDate) : "1999999999";
+                const name = c.name;
+                const value = c.value;
+                netscapeLines.push(`${domain}\t${flag}\t${path}\t${secure}\t${expiration}\t${name}\t${value}`);
+            }
+            cookieContent = netscapeLines.join('\n');
+        }
+        fs.writeFileSync(COOKIES_FILE_PATH, cookieContent, 'utf8');
+        console.log('[Cookies] Loaded successfully into temporary file');
+    } catch (e) {
+        console.warn('[Cookies] Failed to parse YT_COOKIES:', e.message);
+    }
+}
 
 function normalizeMainExt(extVal) {
     const clean = String(extVal || '')
@@ -129,6 +155,10 @@ async function downloadWithYtDlpNoCookies(videoId, maxDurationSec = 900, perAtte
                 '--ffmpeg-location', ffmpegPath
             ];
 
+            if (fs.existsSync(COOKIES_FILE_PATH)) {
+                args.push('--cookies', COOKIES_FILE_PATH);
+            }
+
             if (maxDurationSec > 0 && maxDurationSec <= 950) {
                 args.push('--download-sections', `*0-${maxDurationSec}`);
             }
@@ -168,11 +198,12 @@ async function downloadWithYtdlFallback(videoId, targetFilePath, maxBytes, timeo
     return new Promise((resolve, reject) => {
         let dl = 0;
         const ws = fs.createWriteStream(targetFilePath);
-        const st = ytdl(`https://www.youtube.com/watch?v=${videoId}`, {
+        const ytdlOpts = {
             filter: 'audioonly',
             quality: 'lowestaudio',
             playerClients: ['ANDROID', 'IOS', 'WEB']
-        });
+        };
+        const st = ytdl(`https://www.youtube.com/watch?v=${videoId}`, ytdlOpts);
         const tm = setTimeout(() => {
             try { st.destroy(); } catch (e) {}
             ws.end(() => dl >= 20000 ? resolve(dl) : reject(new Error('ytdl fallback timeout')));
@@ -667,7 +698,7 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
 
 const MAIN_MENU_TEXT = 'ברוכים הבאים לחיפוש ביוטיוב! לשמיעת הפלייליסט שלכם הקישו 1 לשמיעת שיעורי התורה שלכם הקישו 2 לחיפוש מוזיקה חדש הקישו 3 לחיפוש שיעור חדש הקישו 4!';
 
-app.get('/', (req, res) => { res.send('YouTube Personal Line Server v38.0 OK'); });
+app.get('/', (req, res) => { res.send('YouTube Personal Line Server v40.0 OK'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -893,7 +924,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, '0.0.0.0', () => {
-    console.log(`=== Server v38.0 Ready on port ${port} ===`);
+    console.log(`=== Server v40.0 Ready on port ${port} ===`);
     setTimeout(async () => {
         try { await ensureYtDlpBinary(); } catch (e) {}
     }, 2000);
