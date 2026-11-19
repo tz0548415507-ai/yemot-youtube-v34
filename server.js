@@ -269,7 +269,6 @@ async function getNextFileNumberStr(folder, reserveCount = 1) {
     return reserveCount === 1 ? result[0] : result;
 }
 
-// העלאת MP3 דחוס לימות המשיח עם convertAudio=1 לחיסכון משמעותי בתעבורת Render
 async function uploadAudioBufferToExactPath(audioBuffer, exactTargetPath, fileNameLabel = 'audio.mp3', convertAudio = '1', timeoutMs = 45000) {
     const formData = new FormData();
     formData.append('token', TOKEN);
@@ -414,7 +413,6 @@ async function transcribeAudio(audioBase64) {
     throw new Error('GEMINI_ERR: ' + lastErr);
 }
 
-// חילוץ קישור שמע דרך RapidAPI (עם תמיכה ב-start_time / end_time לחיתוך מהיר)
 function extractAudioUrlFromRapidPayload(payload) {
     if (!payload || typeof payload !== 'object') return null;
     const directCandidates = [
@@ -561,7 +559,6 @@ async function downloadSegmentToMp3Fast(videoId, outputMp3Path, startSec = 0, du
             });
         }
 
-        // דחיסה ל-MP3 חסכוני (32kbps מונו) לחיסכון בתעבורת Render
         await new Promise((resolve, reject) => {
             const ffTimer = setTimeout(() => reject(new Error('FFmpeg timeout')), 45000);
             let cmd = ffmpeg(sourcePath);
@@ -589,7 +586,6 @@ async function downloadSegmentToMp3Fast(videoId, outputMp3Path, startSec = 0, du
     }
 }
 
-// הורדה חסכונית: מעלה פעם אחת לארכיון האישי (ומפנה אליו) ולחלקי המשך בתיקייה החיה
 async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFolder, durationSeconds = 0) {
     const cleanLive = String(livePlayFolder).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
     const cleanArchive = String(archiveUserFolder).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
@@ -617,7 +613,6 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
         const extraNums = Array.isArray(rawPartNums) ? rawPartNums : [rawPartNums];
         const chainedPlayCommand = [`f-/${cleanArchive}/${archNum}`, ...extraNums.map(n => `f-/${cleanLive}/${n}`)].join('.');
 
-        // הורדה והעלאה של חלקי ההמשך ברקע
         (async () => {
             for (let i = 1; i < TOTAL_PARTS; i++) {
                 const startSec = i * 900;
@@ -648,7 +643,7 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
 
 const MAIN_MENU_TEXT = 'ברוכים הבאים לחיפוש ביוטיוב! לשמיעת הפלייליסט שלכם הקישו 1 לשמיעת שיעורי התורה שלכם הקישו 2 לחיפוש מוזיקה חדש הקישו 3 לחיפוש שיעור חדש הקישו 4! שימו לב אם הסרטון ארוך מ 15 דקות הוא עולה בחלקים לשלוחת הפלייליסט או לשלוחת השיעורי תורה ! לחזרה לשלוחה הקודמת הקישו כוכבית! הקו מנוטר משתמש שיחפש תוכן לא ראוי יחסם ';
 
-app.get('/', (req, res) => { res.send('YouTube Personal Line Server v41.0 (RapidAPI + Efficient MP3) OK'); });
+app.get('/', (req, res) => { res.send('YouTube Personal Line Server v42.0 (RapidAPI + Efficient MP3) OK'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -894,5 +889,5 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, '0.0.0.0', () => {
-    console.log(`=== Server v41.0 Ready on port ${port} ===`);
+    console.log(`=== Server v42.0 Ready on port ${port} ===`);
 });
