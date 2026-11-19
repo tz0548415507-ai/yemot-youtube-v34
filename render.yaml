@@ -18,29 +18,5 @@ services:
         sync: false
       - key: YEMOT_TOKEN
         sync: false
-      - key: PROXY_URL
-        sync: false
-      - key: PROXY_URL_BACKUP
-        sync: false
       - key: YT_COOKIES_B64
-        sync: false
-      - key: COBALT_API_URL
-        sync: false
-      - key: COBALT_API_KEY
-        sync: false
-      - key: RAPIDAPI_KEY
-        sync: false
-      - key: RAPIDAPI_HOST
-        value: "youtube-mp36.p.rapidapi.com"
-      - key: RAPIDAPI_ENDPOINT
-        value: "auto"
-      - key: RAPIDAPI_KEY2
-        sync: false
-      - key: RAPIDAPI_HOST2
-        sync: false
-      - key: RAPIDAPI_ENDPOINT2
-        value: "auto"
-      - key: ENGINE_ORDER
-        value: "ytdlp_proxy,ytdlp_cookies,cobalt,rapidapi1,rapidapi2,ytdlp_direct,piped"
-      - key: PIPED_INSTANCES
         sync: false
