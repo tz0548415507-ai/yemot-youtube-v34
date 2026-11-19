@@ -5,7 +5,6 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const { execFile } = require('child_process');
-const ytdl = require('@distube/ytdl-core');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -20,9 +19,12 @@ const YT_KEY2 = (process.env.YOUTUBE_API_KEY2 || '').trim();
 const YT_KEYS = [YT_KEY, YT_KEY2].filter(Boolean);
 let activeYtKeyIndex = 0;
 
+const RAPIDAPI_KEY = (process.env.RAPIDAPI_KEY || '').trim();
+const RAPIDAPI_HOST = (process.env.RAPIDAPI_HOST || 'youtube-info-download-api.p.rapidapi.com').trim();
+
 const YM = 'https://www.call2all.co.il/ym/api/';
-const ADMIN_LOG_EXT = (process.env.ADMIN_LOG_EXT || '8').trim();
-const ENV_MAIN_EXT = (process.env.MAIN_EXT || '').trim();
+const ADMIN_LOG_EXT = '8';
+const YOUTUBE_MAIN_EXT = '/1/0000000144';
 const RESULTS_PER_PAGE = 7;
 
 let cachedModelName = null;
@@ -32,202 +34,7 @@ const configuredPlayfileDirs = new Set();
 const userSessionState = new Map();
 
 const YTDLP_BIN_PATH = path.join(os.tmpdir(), 'yt-dlp-linux');
-const COOKIES_FILE_PATH = path.join(os.tmpdir(), 'yt_cookies.txt');
 let ytdlpReadyPromise = null;
-
-if (process.env.YT_COOKIES) {
-    try {
-        let cookieContent = process.env.YT_COOKIES.trim();
-        if (cookieContent.startsWith('[')) {
-            const parsed = JSON.parse(cookieContent);
-            let netscapeLines = ["# Netscape HTTP Cookie File"];
-            for (const c of parsed) {
-                const domain = c.domain || '.youtube.com';
-                const flag = domain.startsWith('.') ? "TRUE" : "FALSE";
-                const path = c.path || '/';
-                const secure = c.secure ? "TRUE" : "FALSE";
-                const expiration = c.expirationDate ? Math.floor(c.expirationDate) : "1999999999";
-                const name = c.name;
-                const value = c.value;
-                netscapeLines.push(`${domain}\t${flag}\t${path}\t${secure}\t${expiration}\t${name}\t${value}`);
-            }
-            cookieContent = netscapeLines.join('\n');
-        }
-        fs.writeFileSync(COOKIES_FILE_PATH, cookieContent, 'utf8');
-        console.log('[Cookies] Loaded successfully into temporary file');
-    } catch (e) {
-        console.warn('[Cookies] Failed to parse YT_COOKIES:', e.message);
-    }
-}
-
-function normalizeMainExt(extVal) {
-    const clean = String(extVal || '')
-        .replace(/^ivr2:\/*/, '')
-        .replace(/^\/+/, '')
-        .replace(/\/+$/, '')
-        .trim();
-    return clean ? `/${clean}` : '/9';
-}
-
-function findDownloadedFileByPrefix(prefix) {
-    try {
-        const files = fs.readdirSync(os.tmpdir());
-        const match = files.find(f =>
-            f.startsWith(prefix + '.') &&
-            !f.endsWith('.part') &&
-            !f.endsWith('.ytdl') &&
-            !f.endsWith('.temp')
-        );
-        if (match) {
-            const fullPath = path.join(os.tmpdir(), match);
-            const stat = fs.statSync(fullPath);
-            if (stat.size > 20000) {
-                return { filePath: fullPath, size: stat.size };
-            }
-        }
-    } catch (e) {}
-    return null;
-}
-
-function cleanupFilesByPrefix(prefix) {
-    try {
-        const files = fs.readdirSync(os.tmpdir());
-        for (const f of files) {
-            if (f.startsWith(prefix)) {
-                fs.promises.unlink(path.join(os.tmpdir(), f)).catch(() => null);
-            }
-        }
-    } catch (e) {}
-}
-
-async function ensureYtDlpBinary() {
-    if (ytdlpReadyPromise) return ytdlpReadyPromise;
-
-    ytdlpReadyPromise = (async () => {
-        try {
-            if (fs.existsSync(YTDLP_BIN_PATH) && fs.statSync(YTDLP_BIN_PATH).size > 1000000) {
-                await fs.promises.chmod(YTDLP_BIN_PATH, 0o755);
-                return YTDLP_BIN_PATH;
-            }
-            console.log('[yt-dlp] Downloading standalone yt-dlp_linux binary...');
-            const binUrl = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
-            const res = await fetchWithTimeout(binUrl, {}, 45000);
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            const buf = Buffer.from(await res.arrayBuffer());
-            await fs.promises.writeFile(YTDLP_BIN_PATH, buf);
-            await fs.promises.chmod(YTDLP_BIN_PATH, 0o755);
-            console.log(`[yt-dlp] Binary ready at ${YTDLP_BIN_PATH} (${buf.length} bytes)`);
-            return YTDLP_BIN_PATH;
-        } catch (err) {
-            console.warn('[yt-dlp] Binary setup error:', err.message);
-            ytdlpReadyPromise = null;
-            throw err;
-        }
-    })();
-
-    return ytdlpReadyPromise;
-}
-
-async function downloadWithYtDlpNoCookies(videoId, maxDurationSec = 900, perAttemptTimeoutMs = 18000) {
-    const binPath = await ensureYtDlpBinary();
-    const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
-    
-    const clientStrategies = [
-        'youtube:player_client=android,web',
-        'youtube:player_client=ios,mweb',
-        'youtube:player_client=tv_embedded,android_vr'
-    ];
-
-    const uniquePrefix = `ytdlp_${videoId}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const outputTemplate = path.join(os.tmpdir(), `${uniquePrefix}.%(ext)s`);
-
-    let lastErr = '';
-    for (const extractorArg of clientStrategies) {
-        cleanupFilesByPrefix(uniquePrefix);
-        try {
-            const args = [
-                '--no-playlist',
-                '--no-check-certificates',
-                '--no-cache-dir',
-                '--force-ipv4',
-                '--extractor-args', extractorArg,
-                '-f', 'bestaudio[ext=m4a]/bestaudio/worst',
-                '--ffmpeg-location', ffmpegPath
-            ];
-
-            if (fs.existsSync(COOKIES_FILE_PATH)) {
-                args.push('--cookies', COOKIES_FILE_PATH);
-            }
-
-            if (maxDurationSec > 0 && maxDurationSec <= 950) {
-                args.push('--download-sections', `*0-${maxDurationSec}`);
-            }
-
-            args.push('-o', outputTemplate, videoUrl);
-
-            await new Promise((resolve, reject) => {
-                execFile(binPath, args, { timeout: perAttemptTimeoutMs, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
-                    const found = findDownloadedFileByPrefix(uniquePrefix);
-                    if (found) {
-                        return resolve();
-                    }
-                    reject(new Error((stderr || (error && error.message) || 'yt-dlp failed').slice(-300)));
-                });
-            });
-
-            const found = findDownloadedFileByPrefix(uniquePrefix);
-            if (found) {
-                console.log(`[yt-dlp Success] Downloaded ${found.size} bytes using ${extractorArg}`);
-                return {
-                    filePath: found.filePath,
-                    size: found.size,
-                    cleanup: () => cleanupFilesByPrefix(uniquePrefix)
-                };
-            }
-        } catch (err) {
-            lastErr = err.message;
-            console.warn(`[yt-dlp Attempt Failed] (${extractorArg}):`, lastErr.slice(0, 180));
-            cleanupFilesByPrefix(uniquePrefix);
-        }
-    }
-
-    throw new Error('YTDLP_ALL_STRATEGIES_FAILED: ' + lastErr);
-}
-
-async function downloadWithYtdlFallback(videoId, targetFilePath, maxBytes, timeoutMs = 12000) {
-    return new Promise((resolve, reject) => {
-        let dl = 0;
-        const ws = fs.createWriteStream(targetFilePath);
-        const ytdlOpts = {
-            filter: 'audioonly',
-            quality: 'lowestaudio',
-            playerClients: ['ANDROID', 'IOS', 'WEB']
-        };
-        const st = ytdl(`https://www.youtube.com/watch?v=${videoId}`, ytdlOpts);
-        const tm = setTimeout(() => {
-            try { st.destroy(); } catch (e) {}
-            ws.end(() => dl >= 20000 ? resolve(dl) : reject(new Error('ytdl fallback timeout')));
-        }, timeoutMs);
-
-        st.on('data', c => {
-            dl += c.length;
-            ws.write(c);
-            if (dl >= maxBytes) {
-                clearTimeout(tm);
-                try { st.destroy(); } catch (e) {}
-                ws.end(() => resolve(dl));
-            }
-        });
-        st.on('end', () => {
-            clearTimeout(tm);
-            ws.end(() => dl >= 20000 ? resolve(dl) : reject(new Error('ytdl fallback empty stream')));
-        });
-        st.on('error', e => {
-            clearTimeout(tm);
-            ws.end(() => dl >= 150000 ? resolve(dl) : reject(e));
-        });
-    });
-}
 
 function lastVal(param) {
     if (Array.isArray(param)) {
@@ -386,11 +193,9 @@ async function getUserNameIfRegistered(phone) {
     return null;
 }
 
-async function ensurePlayfileExtension(folderPathStr, returnExt) {
+async function ensurePlayfileExtension(folderPathStr) {
     const clean = String(folderPathStr).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
-    const targetReturn = normalizeMainExt(returnExt);
-    const cacheKey = `${clean}|${targetReturn}`;
-    if (configuredPlayfileDirs.has(cacheKey)) return;
+    if (configuredPlayfileDirs.has(clean)) return;
 
     try {
         const body = new URLSearchParams({
@@ -406,15 +211,15 @@ async function ensurePlayfileExtension(folderPathStr, returnExt) {
 
         const playfileIni = [
             'type=playfile',
-            `playfile_end_goto=${targetReturn}`,
-            `empty_goto=${targetReturn}`,
-            `root_goto=${targetReturn}`,
-            `control_play_return=${targetReturn}`,
-            `control_play#=${targetReturn}`
+            `playfile_end_goto=${YOUTUBE_MAIN_EXT}`,
+            `empty_goto=${YOUTUBE_MAIN_EXT}`,
+            `root_goto=${YOUTUBE_MAIN_EXT}`,
+            `control_play_return=${YOUTUBE_MAIN_EXT}`,
+            `control_play#=${YOUTUBE_MAIN_EXT}`
         ].join('\r\n') + '\r\n';
         await uploadTextToExactPath(playfileIni, `ivr2:/${clean}/ext.ini`, 'ext.ini');
 
-        configuredPlayfileDirs.add(cacheKey);
+        configuredPlayfileDirs.add(clean);
     } catch (e) {}
 }
 
@@ -464,19 +269,22 @@ async function getNextFileNumberStr(folder, reserveCount = 1) {
     return reserveCount === 1 ? result[0] : result;
 }
 
-async function uploadWavBufferToExactPath(wavBuffer, exactTargetPath, fileNameLabel = 'audio.wav', timeoutMs = 45000) {
+// העלאת MP3 דחוס לימות המשיח עם convertAudio=1 לחיסכון משמעותי בתעבורת Render
+async function uploadAudioBufferToExactPath(audioBuffer, exactTargetPath, fileNameLabel = 'audio.mp3', convertAudio = '1', timeoutMs = 45000) {
     const formData = new FormData();
     formData.append('token', TOKEN);
     formData.append('path', exactTargetPath);
-    formData.append('convertAudio', '0');
-    formData.append('file', new Blob([wavBuffer], { type: 'audio/wav' }), fileNameLabel);
+    formData.append('convertAudio', String(convertAudio));
+    formData.append('file', new Blob([audioBuffer], { type: 'audio/mpeg' }), fileNameLabel);
 
     const upRes = await fetchWithTimeout(`${YM}UploadFile`, {
         method: 'POST',
         body: formData
     }, timeoutMs);
 
-    return await upRes.text();
+    const upText = await upRes.text();
+    console.log(`[Yemot Upload -> ${exactTargetPath}] (${audioBuffer.length} bytes, convertAudio=${convertAudio}) Response:`, upText.slice(0, 180));
+    return upText;
 }
 
 async function saveAdminLogToExt8(callerPhone, userName, categoryLabel, searchQuery, downloadedTitle, statusText) {
@@ -606,99 +414,241 @@ async function transcribeAudio(audioBase64) {
     throw new Error('GEMINI_ERR: ' + lastErr);
 }
 
-async function convertSegmentToWavFast(inputPath, outputWavPath, startSec = 0, durationSec = 900) {
-    await new Promise((resolve, reject) => {
-        const ffTimer = setTimeout(() => reject(new Error('Local FFmpeg segment timeout')), 45000);
-        let cmd = ffmpeg(inputPath);
-
-        const inOpts = [];
-        if (startSec > 0) {
-            inOpts.push(`-ss ${startSec}`);
+// חילוץ קישור שמע דרך RapidAPI (עם תמיכה ב-start_time / end_time לחיתוך מהיר)
+function extractAudioUrlFromRapidPayload(payload) {
+    if (!payload || typeof payload !== 'object') return null;
+    const directCandidates = [
+        payload.url, payload.download_url, payload.downloadUrl,
+        payload.audio_url, payload.audioUrl, payload.link, payload.file
+    ];
+    for (const c of directCandidates) {
+        if (typeof c === 'string' && c.startsWith('http')) return c;
+    }
+    const lists = [payload.audios, payload.audio_formats, payload.formats, payload.items, payload.data];
+    for (const lst of lists) {
+        if (Array.isArray(lst)) {
+            for (const item of lst) {
+                if (!item || typeof item !== 'object') continue;
+                const u = item.url || item.download_url || item.link;
+                if (typeof u === 'string' && u.startsWith('http')) return u;
+            }
         }
-        if (inOpts.length > 0) {
-            cmd = cmd.inputOptions(inOpts);
-        }
-
-        cmd.duration(durationSec)
-            .format('wav')
-            .audioCodec('pcm_s16le')
-            .audioChannels(1)
-            .audioFrequency(8000)
-            .outputOptions(['-threads 0'])
-            .on('end', () => { clearTimeout(ffTimer); resolve(); })
-            .on('error', (err) => { clearTimeout(ffTimer); reject(err); })
-            .save(outputWavPath);
-    });
+    }
+    if (payload.data && typeof payload.data === 'object') {
+        return extractAudioUrlFromRapidPayload(payload.data);
+    }
+    return null;
 }
 
-async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFolder, durationSeconds = 0, returnExt = '/9') {
+async function fetchRapidApiDownloadUrl(videoId, startSec = 0, endSec = 0) {
+    if (!RAPIDAPI_KEY) throw new Error('RAPIDAPI_KEY is missing');
+
+    const headers = {
+        'x-rapidapi-key': RAPIDAPI_KEY,
+        'x-rapidapi-host': RAPIDAPI_HOST
+    };
+
+    const candidates = [];
+    const baseParams = `id=${encodeURIComponent(videoId)}&type=audio&format=mp3&quality=32`;
+    const timeParams = (startSec > 0 || endSec > 0) ? `&start_time=${startSec}&end_time=${endSec}` : '';
+
+    candidates.push(`https://${RAPIDAPI_HOST}/download?${baseParams}${timeParams}`);
+    candidates.push(`https://${RAPIDAPI_HOST}/dl?id=${encodeURIComponent(videoId)}&format=mp3${timeParams}`);
+    candidates.push(`https://${RAPIDAPI_HOST}/api/download?id=${encodeURIComponent(videoId)}&format=mp3${timeParams}`);
+
+    let lastErr = '';
+    for (const ep of candidates) {
+        try {
+            const res = await fetchWithTimeout(ep, { headers }, 20000);
+            if (!res.ok) {
+                lastErr = `HTTP_${res.status}`;
+                continue;
+            }
+            const cType = (res.headers.get('content-type') || '').toLowerCase();
+            if (cType.includes('audio/')) {
+                return { directBuffer: Buffer.from(await res.arrayBuffer()), streamUrl: null };
+            }
+            const json = await res.json();
+            let jobUrl = json.progress_url || json.status_url || (json.data && json.data.progress_url);
+
+            let resolvedUrl = extractAudioUrlFromRapidPayload(json);
+            if (!resolvedUrl && jobUrl && typeof jobUrl === 'string' && jobUrl.startsWith('http')) {
+                for (let attempt = 0; attempt < 8; attempt++) {
+                    await new Promise(r => setTimeout(r, 2500));
+                    const pRes = await fetchWithTimeout(jobUrl, { headers }, 12000);
+                    if (!pRes.ok) break;
+                    const pJson = await pRes.json();
+                    resolvedUrl = extractAudioUrlFromRapidPayload(pJson);
+                    if (resolvedUrl) break;
+                    const st = String(pJson.status || (pJson.data && pJson.data.status) || '').toLowerCase();
+                    if (st === 'failed' || st === 'error') break;
+                }
+            }
+            if (resolvedUrl) {
+                return { directBuffer: null, streamUrl: resolvedUrl };
+            }
+            lastErr = 'No audio URL in response';
+        } catch (e) {
+            lastErr = e.message;
+        }
+    }
+    throw new Error('RAPIDAPI_ERR: ' + lastErr);
+}
+
+async function ensureYtDlpBinary() {
+    if (ytdlpReadyPromise) return ytdlpReadyPromise;
+    ytdlpReadyPromise = (async () => {
+        if (fs.existsSync(YTDLP_BIN_PATH) && fs.statSync(YTDLP_BIN_PATH).size > 1000000) {
+            await fs.promises.chmod(YTDLP_BIN_PATH, 0o755);
+            return YTDLP_BIN_PATH;
+        }
+        const binUrl = 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux';
+        const res = await fetchWithTimeout(binUrl, {}, 45000);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const buf = Buffer.from(await res.arrayBuffer());
+        await fs.promises.writeFile(YTDLP_BIN_PATH, buf);
+        await fs.promises.chmod(YTDLP_BIN_PATH, 0o755);
+        return YTDLP_BIN_PATH;
+    })();
+    return ytdlpReadyPromise;
+}
+
+async function downloadSegmentToMp3Fast(videoId, outputMp3Path, startSec = 0, durationSec = 900) {
+    let sourcePath = null;
+    const tmpRaw = path.join(os.tmpdir(), `raw_${videoId}_${startSec}_${Date.now()}.bin`);
+
+    try {
+        if (RAPIDAPI_KEY) {
+            const endSec = durationSec > 0 ? (startSec + durationSec) : 0;
+            const rapidRes = await fetchRapidApiDownloadUrl(videoId, startSec, endSec);
+            if (rapidRes.directBuffer && rapidRes.directBuffer.length > 20000) {
+                await fs.promises.writeFile(tmpRaw, rapidRes.directBuffer);
+                sourcePath = tmpRaw;
+            } else if (rapidRes.streamUrl) {
+                const dlRes = await fetchWithTimeout(rapidRes.streamUrl, {}, 35000);
+                if (dlRes.ok) {
+                    const buf = Buffer.from(await dlRes.arrayBuffer());
+                    if (buf.length > 20000) {
+                        await fs.promises.writeFile(tmpRaw, buf);
+                        sourcePath = tmpRaw;
+                    }
+                }
+            }
+        }
+
+        if (!sourcePath) {
+            const binPath = await ensureYtDlpBinary();
+            const prefix = `yt_${videoId}_${startSec}_${Date.now()}`;
+            const tmpl = path.join(os.tmpdir(), `${prefix}.%(ext)s`);
+            const args = [
+                '--no-playlist', '--no-check-certificates', '--no-cache-dir', '--force-ipv4',
+                '-f', 'bestaudio/worst', '--ffmpeg-location', ffmpegPath
+            ];
+            if (durationSec > 0) {
+                args.push('--download-sections', `*${startSec}-${startSec + durationSec}`);
+            }
+            args.push('-o', tmpl, `https://www.youtube.com/watch?v=${videoId}`);
+
+            await new Promise((resolve, reject) => {
+                execFile(binPath, args, { timeout: 30000, maxBuffer: 8 * 1024 * 1024 }, (err) => {
+                    const files = fs.readdirSync(os.tmpdir()).filter(f => f.startsWith(prefix + '.') && !f.endsWith('.part'));
+                    if (files.length > 0) {
+                        sourcePath = path.join(os.tmpdir(), files[0]);
+                        return resolve();
+                    }
+                    reject(err || new Error('Download failed'));
+                });
+            });
+        }
+
+        // דחיסה ל-MP3 חסכוני (32kbps מונו) לחיסכון בתעבורת Render
+        await new Promise((resolve, reject) => {
+            const ffTimer = setTimeout(() => reject(new Error('FFmpeg timeout')), 45000);
+            let cmd = ffmpeg(sourcePath);
+            if (startSec > 0 && !RAPIDAPI_KEY) {
+                cmd = cmd.inputOptions([`-ss ${startSec}`]);
+            }
+            if (durationSec > 0) {
+                cmd = cmd.duration(durationSec);
+            }
+            cmd.format('mp3')
+                .audioCodec('libmp3lame')
+                .audioBitrate('32k')
+                .audioChannels(1)
+                .audioFrequency(16000)
+                .outputOptions(['-threads 0'])
+                .on('end', () => { clearTimeout(ffTimer); resolve(); })
+                .on('error', (err) => { clearTimeout(ffTimer); reject(err); })
+                .save(outputMp3Path);
+        });
+    } finally {
+        fs.promises.unlink(tmpRaw).catch(() => null);
+        if (sourcePath && sourcePath !== tmpRaw) {
+            fs.promises.unlink(sourcePath).catch(() => null);
+        }
+    }
+}
+
+// הורדה חסכונית: מעלה פעם אחת לארכיון האישי (ומפנה אליו) ולחלקי המשך בתיקייה החיה
+async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFolder, durationSeconds = 0) {
     const cleanLive = String(livePlayFolder).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
     const cleanArchive = String(archiveUserFolder).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
 
-    const tmpQuickWav = path.join(os.tmpdir(), `quick_out_${videoId}_${Date.now()}.wav`);
-    const tmpFallbackIn = path.join(os.tmpdir(), `quick_fb_${videoId}_${Date.now()}.webm`);
-    let quickCleanup = () => fs.promises.unlink(tmpFallbackIn).catch(() => null);
+    const isLongVideo = durationSeconds > 900;
+    const firstChunkSec = isLongVideo ? 900 : 0;
+    const tmpFirstMp3 = path.join(os.tmpdir(), `first_${videoId}_${Date.now()}.mp3`);
 
     try {
-        const isLongVideo = durationSeconds > 900;
-        const firstChunkDuration = isLongVideo ? 905 : 0;
-        let quickInputPath = null;
+        await downloadSegmentToMp3Fast(videoId, tmpFirstMp3, 0, firstChunkSec);
+        const firstMp3Buf = await fs.promises.readFile(tmpFirstMp3);
+        fs.promises.unlink(tmpFirstMp3).catch(() => null);
 
-        try {
-            const dlRes = await downloadWithYtDlpNoCookies(videoId, firstChunkDuration, 16000);
-            quickInputPath = dlRes.filePath;
-            quickCleanup = dlRes.cleanup;
-        } catch (ytdlpErr) {
-            await downloadWithYtdlFallback(videoId, tmpFallbackIn, 5.5 * 1024 * 1024, 10000);
-            quickInputPath = tmpFallbackIn;
+        await ensurePlayfileExtension(cleanArchive);
+        const archNum = await getNextFileNumberStr(cleanArchive, 1);
+        const archPath = `ivr2:/${cleanArchive}/${archNum}.mp3`;
+        await uploadAudioBufferToExactPath(firstMp3Buf, archPath, `${archNum}.mp3`, '1', 30000);
+
+        if (!isLongVideo) {
+            return `f-/${cleanArchive}/${archNum}`;
         }
 
-        await convertSegmentToWavFast(quickInputPath, tmpQuickWav, 0, 900);
+        const TOTAL_PARTS = Math.min(6, Math.max(2, Math.ceil((durationSeconds - 10) / 900)));
+        const rawPartNums = await getNextFileNumberStr(cleanLive, TOTAL_PARTS - 1);
+        const extraNums = Array.isArray(rawPartNums) ? rawPartNums : [rawPartNums];
+        const chainedPlayCommand = [`f-/${cleanArchive}/${archNum}`, ...extraNums.map(n => `f-/${cleanLive}/${n}`)].join('.');
 
-        let quickWavBuf = await fs.promises.readFile(tmpQuickWav);
-        quickCleanup();
-        fs.promises.unlink(tmpQuickWav).catch(() => null);
-
-        const isFullFifteenMin = quickWavBuf.length >= 13800000;
-        const isLongStream = (durationSeconds > 900) ? true : (durationSeconds > 0 ? false : isFullFifteenMin);
-
-        if (!isLongStream) {
-            const singleNum = await getNextFileNumberStr(cleanLive, 1);
-            const singlePath = `ivr2:/${cleanLive}/${singleNum}.wav`;
-            await uploadWavBufferToExactPath(quickWavBuf, singlePath, `${singleNum}.wav`, 25000);
-
-            (async () => {
+        // הורדה והעלאה של חלקי ההמשך ברקע
+        (async () => {
+            for (let i = 1; i < TOTAL_PARTS; i++) {
+                const startSec = i * 900;
+                const tmpPartMp3 = path.join(os.tmpdir(), `part_${i}_${videoId}_${Date.now()}.mp3`);
                 try {
-                    await ensurePlayfileExtension(cleanArchive, returnExt);
-                    const archNum = await getNextFileNumberStr(cleanArchive, 1);
-                    const archTargetPath = `ivr2:/${cleanArchive}/${archNum}.wav`;
-                    await uploadWavBufferToExactPath(quickWavBuf, archTargetPath, `${archNum}.wav`, 30000);
-                } catch (e) {}
-            })();
-
-            return `f-/${cleanLive}/${singleNum}`;
-        }
-
-        const TOTAL_PARTS = durationSeconds > 900 ? Math.min(6, Math.max(2, Math.ceil((durationSeconds - 10) / 900))) : 6;
-        const rawPartNums = await getNextFileNumberStr(cleanLive, TOTAL_PARTS);
-        const partNums = Array.isArray(rawPartNums) ? rawPartNums : [rawPartNums];
-        const partPaths = partNums.map(num => `ivr2:/${cleanLive}/${num}.wav`);
-        const partCmds = partNums.map(num => `f-/${cleanLive}/${num}`);
-        const chainedPlayCommand = partCmds.join('.');
-
-        await uploadWavBufferToExactPath(quickWavBuf, partPaths[0], `${partNums[0]}.wav`, 20000);
+                    await downloadSegmentToMp3Fast(videoId, tmpPartMp3, startSec, 900);
+                    if (fs.existsSync(tmpPartMp3)) {
+                        const partBuf = await fs.promises.readFile(tmpPartMp3);
+                        if (partBuf.length > 5000) {
+                            const liveNum = extraNums[i - 1];
+                            await uploadAudioBufferToExactPath(partBuf, `ivr2:/${cleanLive}/${liveNum}.mp3`, `${liveNum}.mp3`, '1', 40000);
+                        }
+                    }
+                } catch (e) {
+                    console.warn(`[Part ${i + 1} Error]`, e.message);
+                } finally {
+                    fs.promises.unlink(tmpPartMp3).catch(() => null);
+                }
+            }
+        })();
 
         return chainedPlayCommand;
     } catch (e) {
-        quickCleanup();
-        fs.promises.unlink(tmpQuickWav).catch(() => null);
+        fs.promises.unlink(tmpFirstMp3).catch(() => null);
         throw e;
     }
 }
 
-const MAIN_MENU_TEXT = 'ברוכים הבאים לחיפוש ביוטיוב! לשמיעת הפלייליסט שלכם הקישו 1 לשמיעת שיעורי התורה שלכם הקישו 2 לחיפוש מוזיקה חדש הקישו 3 לחיפוש שיעור חדש הקישו 4!';
+const MAIN_MENU_TEXT = 'ברוכים הבאים לחיפוש ביוטיוב! לשמיעת הפלייליסט שלכם הקישו 1 לשמיעת שיעורי התורה שלכם הקישו 2 לחיפוש מוזיקה חדש הקישו 3 לחיפוש שיעור חדש הקישו 4! שימו לב אם הסרטון ארוך מ 15 דקות הוא עולה בחלקים לשלוחת הפלייליסט או לשלוחת השיעורי תורה ! לחזרה לשלוחה הקודמת הקישו כוכבית! הקו מנוטר משתמש שיחפש תוכן לא ראוי יחסם ';
 
-app.get('/', (req, res) => { res.send('YouTube Personal Line Server v40.0 OK'); });
+app.get('/', (req, res) => { res.send('YouTube Personal Line Server v41.0 (RapidAPI + Efficient MP3) OK'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -707,7 +657,6 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     try {
         const callerPhone = lastVal(q.ApiPhone).replace(/[^0-9]/g, '');
         const callId = lastVal(q.ApiCallId);
-        const currentMainExt = normalizeMainExt(q.main_ext || ENV_MAIN_EXT || lastVal(q.ApiExtension) || '/9');
 
         if (q.hangup === 'yes') {
             if (callerPhone) userSessionState.delete(callerPhone);
@@ -715,7 +664,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
         }
 
         if (!callerPhone) {
-            return res.send(`id_list_message=t-שגיאה בזיהוי מספר הטלפון&go_to_folder=${currentMainExt}`);
+            return res.send(`id_list_message=t-שגיאה בזיהוי מספר הטלפון&go_to_folder=${YOUTUBE_MAIN_EXT}`);
         }
 
         const hasMenuChoiceParam = (q.MenuChoice !== undefined);
@@ -790,11 +739,13 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             const registeredName = (await getUserNameIfRegistered(callerPhone)) || 'משתמש רשום';
 
             try {
-                const playCmd = await downloadAndPreparePlayback(chosenVideo.videoId, tempRecFolder, archiveFolder, chosenVideo.durationSeconds || 0, currentMainExt);
+                const playCmd = await downloadAndPreparePlayback(chosenVideo.videoId, tempRecFolder, archiveFolder, chosenVideo.durationSeconds || 0);
                 saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, chosenVideo.title, `הורד בהצלחה לשלוחה ${archiveFolder}`);
                 userSessionState.set(callerPhone, { step: 'WAIT_MENU', callId });
-                return res.send(`id_list_message=t-משמיע ${chosenVideo.title}.${playCmd}&go_to_folder=${currentMainExt}`);
+                const durationPart = chosenVideo.durationText ? ` באורך ${chosenVideo.durationText}` : '';
+                return res.send(`id_list_message=t-משמיע ${chosenVideo.title}${durationPart}.${playCmd}&go_to_folder=${YOUTUBE_MAIN_EXT}`);
             } catch (audioErr) {
+                console.error('[Download Error]', audioErr.message);
                 userSessionState.set(callerPhone, { step: 'WAIT_MENU', callId });
                 return res.send(`id_list_message=t-נמצא ${chosenVideo.title} אך אירעה שגיאה בטעינת הקובץ&read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
             }
@@ -815,9 +766,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             }
 
             let rawText = '';
-            try {
-                rawText = await transcribeAudio(audioBuf.toString('base64'));
-            } catch (gemErr) {
+            try { rawText = await transcribeAudio(audioBuf.toString('base64')); } catch (gemErr) {
                 userSessionState.set(callerPhone, { step: 'WAIT_MENU', callId });
                 return res.send(`id_list_message=t-שגיאה במנוע זיהוי הדיבור&read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
             }
@@ -854,6 +803,27 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
                 return res.send(`id_list_message=t-לא נמצאו תוצאות&read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
             }
 
+            try {
+                const idsList = validItems.map(v => v.videoId).join(',');
+                const durBaseUrl = `https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id=${encodeURIComponent(idsList)}`;
+                const { res: durRes, data: durData } = await fetchYouTubeWithFallback(durBaseUrl, 5000);
+                if (durRes && durRes.ok) {
+                    const durMap = new Map();
+                    for (const vItem of (durData.items || [])) {
+                        if (vItem.id && vItem.contentDetails?.duration) {
+                            durMap.set(vItem.id, parseIsoDurationToHebrew(vItem.contentDetails.duration));
+                        }
+                    }
+                    for (const item of validItems) {
+                        const dInfo = durMap.get(item.videoId);
+                        if (dInfo) {
+                            item.durationSeconds = dInfo.seconds;
+                            item.durationText = dInfo.text;
+                        }
+                    }
+                }
+            } catch (e) {}
+
             const menuPromptText = buildPagePromptText(cleanQuery, validItems, 0);
             userSessionState.set(callerPhone, { step: 'WAIT_SELECT_RESULT', cleanQuery, isMusic, results: validItems, pageIndex: 0, menuPromptText, callId });
             return res.send(`read=t-${menuPromptText}=SelectResult,no,1,1,7,Digits,no`);
@@ -865,12 +835,12 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
                 return res.send('go_to_folder=..');
             }
             if (menuChoice === '1') {
-                await ensurePlayfileExtension(musicExtFolder, currentMainExt);
+                await ensurePlayfileExtension(musicExtFolder);
                 userSessionState.set(callerPhone, { step: 'IN_PLAYLIST', callId });
                 return res.send(`go_to_folder=/${musicExtFolder}`);
             }
             if (menuChoice === '2') {
-                await ensurePlayfileExtension(torahExtFolder, currentMainExt);
+                await ensurePlayfileExtension(torahExtFolder);
                 userSessionState.set(callerPhone, { step: 'IN_PLAYLIST', callId });
                 return res.send(`go_to_folder=/${torahExtFolder}`);
             }
@@ -900,12 +870,12 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             try { rawName = await transcribeAudio(audioBuf.toString('base64')); } catch (e) {}
             const cleanName = sanitizeForYemotTts(rawName, 40) || 'משתמש רשום';
 
-            await uploadWavBufferToExactPath(audioBuf, `ivr2:/${userFolder}/name.wav`, 'name.wav');
+            await uploadAudioBufferToExactPath(audioBuf, `ivr2:/${userFolder}/name.wav`, 'name.wav', '0');
             await uploadTextToExactPath(cleanName, `ivr2:/${userFolder}/name.txt`, 'name.txt');
             userNamesCache.set(callerPhone, cleanName);
 
-            await ensurePlayfileExtension(musicExtFolder, currentMainExt);
-            await ensurePlayfileExtension(torahExtFolder, currentMainExt);
+            await ensurePlayfileExtension(musicExtFolder);
+            await ensurePlayfileExtension(torahExtFolder);
             saveAdminLogToExt8(callerPhone, cleanName, 'רישום למערכת', 'הקלטת שם משתמש', '', 'נרשם בהצלחה');
 
             userSessionState.set(callerPhone, { step: 'WAIT_MENU', callId });
@@ -924,8 +894,5 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, '0.0.0.0', () => {
-    console.log(`=== Server v40.0 Ready on port ${port} ===`);
-    setTimeout(async () => {
-        try { await ensureYtDlpBinary(); } catch (e) {}
-    }, 2000);
+    console.log(`=== Server v41.0 Ready on port ${port} ===`);
 });
