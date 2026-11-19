@@ -416,7 +416,7 @@ async function transcribeAudio(audioBase64) {
 function extractAudioUrlFromRapidPayload(payload) {
     if (!payload || typeof payload !== 'object') return null;
     const directCandidates = [
-        payload.url, payload.download_url, payload.downloadUrl,
+        payload.download_url, payload.downloadUrl, payload.url,
         payload.audio_url, payload.audioUrl, payload.link, payload.file
     ];
     for (const c of directCandidates) {
@@ -427,7 +427,7 @@ function extractAudioUrlFromRapidPayload(payload) {
         if (Array.isArray(lst)) {
             for (const item of lst) {
                 if (!item || typeof item !== 'object') continue;
-                const u = item.url || item.download_url || item.link;
+                const u = item.download_url || item.url || item.link;
                 if (typeof u === 'string' && u.startsWith('http')) return u;
             }
         }
@@ -446,51 +446,43 @@ async function fetchRapidApiDownloadUrl(videoId, startSec = 0, endSec = 0) {
         'x-rapidapi-host': RAPIDAPI_HOST
     };
 
-    const candidates = [];
-    const baseParams = `id=${encodeURIComponent(videoId)}&type=audio&format=mp3&quality=32`;
-    const timeParams = (startSec > 0 || endSec > 0) ? `&start_time=${startSec}&end_time=${endSec}` : '';
+    const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const params = new URLSearchParams({
+        url: ytUrl,
+        format: 'mp3',
+        audio_quality: '64'
+    });
+    if (startSec > 0) params.set('start_time', String(startSec));
+    if (endSec > 0) params.set('end_time', String(endSec));
 
-    candidates.push(`https://${RAPIDAPI_HOST}/download?${baseParams}${timeParams}`);
-    candidates.push(`https://${RAPIDAPI_HOST}/dl?id=${encodeURIComponent(videoId)}&format=mp3${timeParams}`);
-    candidates.push(`https://${RAPIDAPI_HOST}/api/download?id=${encodeURIComponent(videoId)}&format=mp3${timeParams}`);
+    const startEndpoint = `https://${RAPIDAPI_HOST}/ajax/download.php?${params.toString()}`;
+    const res = await fetchWithTimeout(startEndpoint, { headers }, 25000);
+    if (!res.ok) throw new Error(`RAPIDAPI_ERR: HTTP_${res.status}`);
 
-    let lastErr = '';
-    for (const ep of candidates) {
-        try {
-            const res = await fetchWithTimeout(ep, { headers }, 20000);
-            if (!res.ok) {
-                lastErr = `HTTP_${res.status}`;
-                continue;
-            }
-            const cType = (res.headers.get('content-type') || '').toLowerCase();
-            if (cType.includes('audio/')) {
-                return { directBuffer: Buffer.from(await res.arrayBuffer()), streamUrl: null };
-            }
-            const json = await res.json();
-            let jobUrl = json.progress_url || json.status_url || (json.data && json.data.progress_url);
+    const json = await res.json();
+    const jobId = json.id;
+    const jobUrl = json.progress_url || (jobId ? `https://${RAPIDAPI_HOST}/api/progress?id=${encodeURIComponent(jobId)}` : null);
 
-            let resolvedUrl = extractAudioUrlFromRapidPayload(json);
-            if (!resolvedUrl && jobUrl && typeof jobUrl === 'string' && jobUrl.startsWith('http')) {
-                for (let attempt = 0; attempt < 8; attempt++) {
-                    await new Promise(r => setTimeout(r, 2500));
-                    const pRes = await fetchWithTimeout(jobUrl, { headers }, 12000);
-                    if (!pRes.ok) break;
-                    const pJson = await pRes.json();
-                    resolvedUrl = extractAudioUrlFromRapidPayload(pJson);
-                    if (resolvedUrl) break;
-                    const st = String(pJson.status || (pJson.data && pJson.data.status) || '').toLowerCase();
-                    if (st === 'failed' || st === 'error') break;
-                }
+    let resolvedUrl = extractAudioUrlFromRapidPayload(json);
+    if (!resolvedUrl && jobUrl) {
+        for (let attempt = 0; attempt < 20; attempt++) {
+            await new Promise(r => setTimeout(r, 1500));
+            const pHeaders = jobUrl.includes(RAPIDAPI_HOST) ? headers : {};
+            const pRes = await fetchWithTimeout(jobUrl, { headers: pHeaders }, 12000);
+            if (!pRes.ok) continue;
+            const pJson = await pRes.json();
+            resolvedUrl = pJson.download_url || extractAudioUrlFromRapidPayload(pJson);
+            if (resolvedUrl) break;
+            const st = String(pJson.text || pJson.status || '').toLowerCase();
+            if (st === 'failed' || st === 'error' || st === 'expired') {
+                throw new Error(`RAPIDAPI_JOB_FAILED: ${pJson.message || st}`);
             }
-            if (resolvedUrl) {
-                return { directBuffer: null, streamUrl: resolvedUrl };
-            }
-            lastErr = 'No audio URL in response';
-        } catch (e) {
-            lastErr = e.message;
         }
     }
-    throw new Error('RAPIDAPI_ERR: ' + lastErr);
+    if (resolvedUrl) {
+        return { directBuffer: null, streamUrl: resolvedUrl };
+    }
+    throw new Error('RAPIDAPI_ERR: Timeout waiting for download_url');
 }
 
 async function ensureYtDlpBinary() {
@@ -534,7 +526,7 @@ async function downloadSegmentToMp3Fast(videoId, outputMp3Path, startSec = 0, du
             }
         }
 
-        if (!sourcePath) {
+        if (!sourcePath && !RAPIDAPI_KEY) {
             const binPath = await ensureYtDlpBinary();
             const prefix = `yt_${videoId}_${startSec}_${Date.now()}`;
             const tmpl = path.join(os.tmpdir(), `${prefix}.%(ext)s`);
@@ -559,12 +551,13 @@ async function downloadSegmentToMp3Fast(videoId, outputMp3Path, startSec = 0, du
             });
         }
 
+        if (!sourcePath) {
+            throw new Error('RAPIDAPI_DOWNLOAD_EMPTY');
+        }
+
         await new Promise((resolve, reject) => {
             const ffTimer = setTimeout(() => reject(new Error('FFmpeg timeout')), 45000);
             let cmd = ffmpeg(sourcePath);
-            if (startSec > 0 && !RAPIDAPI_KEY) {
-                cmd = cmd.inputOptions([`-ss ${startSec}`]);
-            }
             if (durationSec > 0) {
                 cmd = cmd.duration(durationSec);
             }
@@ -643,7 +636,7 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
 
 const MAIN_MENU_TEXT = 'ברוכים הבאים לחיפוש ביוטיוב! לשמיעת הפלייליסט שלכם הקישו 1 לשמיעת שיעורי התורה שלכם הקישו 2 לחיפוש מוזיקה חדש הקישו 3 לחיפוש שיעור חדש הקישו 4! שימו לב אם הסרטון ארוך מ 15 דקות הוא עולה בחלקים לשלוחת הפלייליסט או לשלוחת השיעורי תורה ! לחזרה לשלוחה הקודמת הקישו כוכבית! הקו מנוטר משתמש שיחפש תוכן לא ראוי יחסם ';
 
-app.get('/', (req, res) => { res.send('YouTube Personal Line Server v42.0 (RapidAPI + Efficient MP3) OK'); });
+app.get('/', (req, res) => { res.send('YouTube Personal Line Server v2.0 (RapidAPI /ajax/download.php + Efficient MP3) OK'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -889,5 +882,5 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, '0.0.0.0', () => {
-    console.log(`=== Server v42.0 Ready on port ${port} ===`);
+    console.log(`=== Server v2.0 Ready on port ${port} ===`);
 });
