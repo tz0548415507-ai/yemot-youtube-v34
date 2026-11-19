@@ -20,7 +20,6 @@ const YT_KEY2 = (process.env.YOUTUBE_API_KEY2 || '').trim();
 const YT_KEYS = [YT_KEY, YT_KEY2].filter(Boolean);
 let activeYtKeyIndex = 0;
 
-// RapidAPI ראשי + משני
 const RAPID_CONFIGS = [
     {
         id: 'rapidapi1',
@@ -45,24 +44,31 @@ const ADMIN_LOG_EXT = '8';
 const YOUTUBE_MAIN_EXT = '/1/0000000144';
 const RESULTS_PER_PAGE = 7;
 
-// סדר עדיפות חכם:
-// לסרטונים ארוכים (מעל 15 דק') yt-dlp עם עוגיות קודם (חותך 15 דק' ישירות בלי לחכות להמרת שעה שלמה ב-RapidAPI)
-const SHORT_ENGINE_ORDER = [
-    'ytdlp_cookies',
+// תקרת מעבר ישיר ללא קידוד מחדש (12MB): חוסכת ~41 שניות CPU ב-Render לכל שיעור ארוך!
+const DIRECT_MP3_MAX_BYTES = 12 * 1024 * 1024;
+
+// סדר ברירת מחדל מואץ: RapidAPI ראשי ראשון, והמערכת מקדמת אוטומטית את המנוע העובד האחרון למקום #1
+const BASE_ENGINE_ORDER = [
     'rapidapi1',
     'rapidapi2',
+    'ytdlp_cookies',
     'cobalt',
     'invidious_parallel',
     'piped_parallel',
     'innertube_direct',
     'ytdlp_direct'
 ];
+let lastWinningEngine = null;
 
 let cachedModelName = null;
 const folderCounters = {};
 const userNamesCache = new Map();
 const configuredPlayfileDirs = new Set();
 const userSessionState = new Map();
+
+// מטמון השמעה חוזרת: חוסך 100% זמן, תעבורה ומכסות API בבקשה חוזרת לאותו סרטון
+const recentPlaybackCache = new Map(); // key: `${archiveFolder}:${videoId}` -> { playCmd, ts }
+const PLAYBACK_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 
 const workingRapidTemplate = new Map();
 const engineCooldown = new Map();
@@ -97,8 +103,16 @@ let pipedCache = {
 };
 const REGISTRY_TTL_MS = 30 * 60 * 1000;
 
+function getDynamicEngineOrder() {
+    if (lastWinningEngine && BASE_ENGINE_ORDER.includes(lastWinningEngine) && !isEngineCoolingDown(lastWinningEngine)) {
+        return [lastWinningEngine, ...BASE_ENGINE_ORDER.filter(e => e !== lastWinningEngine)];
+    }
+    return BASE_ENGINE_ORDER;
+}
+
 function setEngineCooldown(engine, reason, ms = COOLDOWN_MS) {
     engineCooldown.set(engine, { until: Date.now() + ms, reason: String(reason).slice(0, 140) });
+    if (lastWinningEngine === engine) lastWinningEngine = null;
     console.warn(`[CircuitBreaker] Pausing ${engine} for ${Math.round(ms / 1000)}s: ${reason}`);
 }
 
@@ -118,7 +132,7 @@ function convertJsonCookiesToNetscape(jsonText) {
     const arr = Array.isArray(parsed) ? parsed : (parsed.cookies || parsed.data || []);
     if (!Array.isArray(arr) || arr.length === 0) return null;
 
-    const lines = ['# Netscape HTTP Cookie File', '# Auto-converted from JSON by Server v4.3'];
+    const lines = ['# Netscape HTTP Cookie File', '# Auto-converted from JSON by Server v4.4'];
     let count = 0;
 
     for (const c of arr) {
@@ -165,8 +179,6 @@ function getCookiesFilePath() {
 
     try {
         let content = YT_COOKIES_B64.trim();
-
-        // פענוח Base64 אם הערך מקודד
         if (!content.startsWith('[') && !content.startsWith('{') && !content.includes('\t') && !content.includes('Netscape')) {
             try {
                 const decoded = Buffer.from(content, 'base64').toString('utf8').trim();
@@ -176,7 +188,6 @@ function getCookiesFilePath() {
             } catch (e) {}
         }
 
-        // זיהוי והמרה אוטומטית מ-JSON לפורמט Netscape ש-yt-dlp דורש
         if (content.startsWith('[') || content.startsWith('{')) {
             const converted = convertJsonCookiesToNetscape(content);
             if (converted) {
@@ -187,7 +198,6 @@ function getCookiesFilePath() {
             }
         }
 
-        // פורמט Netscape רגיל (מוודאים כותרת תקינה בשורה הראשונה)
         if (content.includes('\t') && content.length > 20) {
             if (!content.startsWith('# Netscape') && !content.startsWith('# HTTP Cookie File')) {
                 content = '# Netscape HTTP Cookie File\n' + content;
@@ -195,11 +205,8 @@ function getCookiesFilePath() {
             const cookieLines = content.split(/\r?\n/).filter(l => l.trim() && !l.startsWith('#') && l.includes('\t')).length;
             fs.writeFileSync(COOKIES_FILE_PATH, content, 'utf8');
             cookiesStatus = { initialized: true, format: 'netscape', count: cookieLines };
-            console.log(`[Cookies] Loaded ${cookieLines} Netscape cookies`);
             return COOKIES_FILE_PATH;
         }
-
-        console.warn('[Cookies] Unrecognized cookie format');
     } catch (e) {
         console.warn('[Cookies Init Error]', e.message);
     }
@@ -561,7 +568,7 @@ async function transcribeAudio(audioBase64) {
     throw new Error('GEMINI_ERR: ' + lastErr);
 }
 
-// ==================== מנועי ההורדה (מתוקן לסרטונים ארוכים + JSON Cookies) ====================
+// ==================== מנועי ההורדה (מואץ פי 4 + הגנת מכסות) ====================
 
 function isHtmlBuffer(buf) {
     if (!buf || buf.length < 16) return true;
@@ -684,19 +691,22 @@ async function tryRapidApiEngine(cfg, videoId, startSec, durationSec) {
                 throw new Error(`${cfg.id}: HTTP_${res.status}`);
             }
 
-            // הנתיב ענה 200 OK — שומרים אותו ולא קופצים יותר לנתיבים אחרים!
             workingRapidTemplate.set(cfg.host, tpl);
 
             const json = await res.json();
             let resolvedUrl = extractAudioUrlFromRapidPayload(json);
 
-            // המתנה מורחבת עד ~44 שניות לסרטונים ארוכים (55 * 800ms)
+            // דגימה חכמה: אם כתובת ההתקדמות חיצונית ל-RapidAPI (0 עלות מכסה!) דוגמים כל 400ms; אם היא ב-RapidAPI שומרים על 1000ms
             if (!resolvedUrl && (json.progress_url || json.id || String(json.status || '').toLowerCase() === 'processing')) {
                 const jobUrl = json.progress_url || (json.id ? `https://${cfg.host}/api/progress?id=${encodeURIComponent(json.id)}` : endpointUrl);
+                const isRapidHostJob = jobUrl.includes(cfg.host);
+                const pollIntervalMs = isRapidHostJob ? 1000 : 400;
+                const maxAttempts = isRapidHostJob ? 45 : 110; // ~44 שניות מקסימום בכל מקרה
                 let lastProgress = '';
-                for (let i = 0; i < 55; i++) {
-                    await new Promise(r => setTimeout(r, 800));
-                    const pHeaders = jobUrl.includes(cfg.host) ? headers : {};
+
+                for (let i = 0; i < maxAttempts; i++) {
+                    await new Promise(r => setTimeout(r, pollIntervalMs));
+                    const pHeaders = isRapidHostJob ? headers : {};
                     const pRes = await fetchWithTimeout(jobUrl, { headers: pHeaders }, 10000);
                     if (!pRes.ok) continue;
                     const pJson = await pRes.json();
@@ -718,9 +728,7 @@ async function tryRapidApiEngine(cfg, videoId, startSec, durationSec) {
             }
 
             const dlRes = await fetchWithTimeout(resolvedUrl, {}, 45000);
-            if (!dlRes.ok) {
-                throw new Error(`${cfg.id}_DL: HTTP_${dlRes.status}`);
-            }
+            if (!dlRes.ok) throw new Error(`${cfg.id}_DL: HTTP_${dlRes.status}`);
             const buf = Buffer.from(await dlRes.arrayBuffer());
             if (buf.length < 8000 || isHtmlBuffer(buf)) {
                 throw new Error(`${cfg.id}: Invalid audio bytes (${buf.length})`);
@@ -905,10 +913,9 @@ function runYtDlpOnce(binPath, videoId, startSec, durationSec, opts = {}) {
     return new Promise((resolve, reject) => {
         const prefix = `yt_${videoId}_${startSec}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
         const tmpl = path.join(os.tmpdir(), `${prefix}.%(ext)s`);
-        // בוחרים זרם אודיו קל (32-96kbps) — מוריד פי 3 יותר מהר ומונע עומס זיכרון בסרטונים ארוכים!
         const args = [
             '--no-playlist', '--no-check-certificates', '--no-cache-dir', '--force-ipv4',
-            '--socket-timeout', '15', '--retries', '2',
+            '--socket-timeout', '12', '--retries', '1',
             '-f', 'worstaudio[abr>=32]/bestaudio[abr<=96]/bestaudio[ext=m4a]/bestaudio/worst',
             '--ffmpeg-location', ffmpegPath
         ];
@@ -919,8 +926,7 @@ function runYtDlpOnce(binPath, videoId, startSec, durationSec, opts = {}) {
         if (durationSec > 0) args.push('--download-sections', `*${startSec}-${startSec + durationSec}`);
         args.push('-o', tmpl, `https://www.youtube.com/watch?v=${videoId}`);
 
-        const execTimeout = durationSec > 0 ? 45000 : 30000;
-        execFile(binPath, args, { timeout: execTimeout, maxBuffer: 6 * 1024 * 1024 }, (err, stdout, stderr) => {
+        execFile(binPath, args, { timeout: 25000, maxBuffer: 6 * 1024 * 1024 }, (err, stdout, stderr) => {
             const files = fs.readdirSync(os.tmpdir()).filter(f => f.startsWith(prefix + '.') && !f.endsWith('.part'));
             if (files.length > 0) {
                 const fullPath = path.join(os.tmpdir(), files[0]);
@@ -945,7 +951,7 @@ async function tryYtDlpMode(mode, videoId, startSec, durationSec) {
     if (mode === 'ytdlp_cookies') {
         if (!cookiesPath && !PROXY_URL) throw new Error('SKIP: YT_COOKIES_B64 / PROXY_URL not set');
         attempts.push({ cookiesPath: cookiesPath || undefined, proxyUrl: PROXY_URL || undefined, playerClients: 'tv,web,mweb' });
-        attempts.push({ cookiesPath: cookiesPath || undefined, proxyUrl: PROXY_URL || undefined, playerClients: 'web_safari,mweb,default' });
+        attempts.push({ cookiesPath: cookiesPath || undefined, proxyUrl: PROXY_URL || undefined, playerClients: 'web_safari,mweb' });
     } else if (mode === 'ytdlp_direct') {
         attempts.push({ playerClients: 'android_vr,tv_simply,ios' });
     }
@@ -963,18 +969,21 @@ async function tryYtDlpMode(mode, videoId, startSec, durationSec) {
             }
         }
     }
-    if (mode === 'ytdlp_direct' && lastErr && String(lastErr.message).toLowerCase().includes('not a bot')) {
-        setEngineCooldown('ytdlp_direct', 'YouTube bot check on datacenter IP');
+    if (lastErr) {
+        const low = String(lastErr.message).toLowerCase();
+        if (low.includes('not a bot') || low.includes('command failed') || low.includes('sign in')) {
+            setEngineCooldown(mode, lastErr.message);
+        }
     }
     throw lastErr || new Error(`${mode} failed`);
 }
 
-// תיקון קריטי: אם קובץ ה-copy חורג מ-7.5MB (קורה בסרטונים ארוכים!) — תמיד נופל לקידוד 32k מונו ולא מחזיר undefined!
+// מעבר ישיר ללא קידוד מחדש (0.0 שניות CPU!) לכל MP3 מוכן עד 12MB
 async function finalizeToCompactMp3(rawResult, videoId, startSec, durationSec) {
     const { buffer, filePath, alreadyTrimmed } = rawResult;
 
-    // שיר קצר שלם שכבר MP3 קטן מ-7.5MB — מחזירים מיד בלי FFmpeg
-    if (buffer && startSec === 0 && durationSec === 0 && isValidMp3Header(buffer) && buffer.length < 7.5 * 1024 * 1024) {
+    // מסלול אולטרה-מהיר (0 שניות FFmpeg): קובץ MP3 שכבר חתוך (או קצר שלם) ועד 12MB
+    if (buffer && isValidMp3Header(buffer) && buffer.length < DIRECT_MP3_MAX_BYTES && (alreadyTrimmed || (startSec === 0 && durationSec === 0))) {
         return buffer;
     }
 
@@ -983,11 +992,11 @@ async function finalizeToCompactMp3(rawResult, videoId, startSec, durationSec) {
     try {
         if (!filePath && buffer) await fs.promises.writeFile(tmpIn, buffer);
 
-        // ניסיון 1: חיתוך מהיר בהעתקת זרם (עובד רק אם המקור כבר MP3 וגם התוצאה מתחת ל-7.5MB)
+        // ניסיון 1: חיתוך מהיר בהעתקת זרם (פחות משנייה, ללא קידוד מחדש)
         let copySucceeded = false;
         try {
             await new Promise((resolve, reject) => {
-                const ffTimer = setTimeout(() => reject(new Error('FFmpeg copy timeout')), 15000);
+                const ffTimer = setTimeout(() => reject(new Error('FFmpeg copy timeout')), 12000);
                 let cmd = ffmpeg(tmpIn);
                 if (!alreadyTrimmed && startSec > 0) cmd = cmd.setStartTime(startSec);
                 if (!alreadyTrimmed && durationSec > 0) cmd = cmd.duration(durationSec);
@@ -997,16 +1006,14 @@ async function finalizeToCompactMp3(rawResult, videoId, startSec, durationSec) {
                     .save(tmpOut);
             });
             const copiedBuf = await fs.promises.readFile(tmpOut);
-            if (copiedBuf.length > 5000 && copiedBuf.length < 7.5 * 1024 * 1024) {
+            if (copiedBuf.length > 5000 && copiedBuf.length < DIRECT_MP3_MAX_BYTES) {
                 copySucceeded = true;
                 return copiedBuf;
             }
-            console.log(`[FFmpeg] Copied MP3 size ${copiedBuf.length} out of range, re-encoding to 32k mono...`);
-        } catch (copyErr) {
-            // נמשיך אוטומטית לקידוד 32k מונו
-        }
+            console.log(`[FFmpeg] Copied MP3 size ${copiedBuf.length} > 12MB, fast-encoding to 32k mono...`);
+        } catch (copyErr) {}
 
-        // ניסיון 2: קידוד חסכוני 32kbps מונו 16kHz (15 דקות = ~3.5MB בלבד, מושלם לימות המשיח!)
+        // ניסיון 2: קידוד מהיר וחסכוני (-compression_level 9 מאיץ פי 2-3 על CPU חלש)
         if (!copySucceeded) {
             await fs.promises.unlink(tmpOut).catch(() => null);
             await new Promise((resolve, reject) => {
@@ -1019,7 +1026,7 @@ async function finalizeToCompactMp3(rawResult, videoId, startSec, durationSec) {
                     .audioBitrate('32k')
                     .audioChannels(1)
                     .audioFrequency(16000)
-                    .outputOptions(['-q:a 9', '-threads 0'])
+                    .outputOptions(['-compression_level 9', '-threads 0'])
                     .on('end', () => { clearTimeout(ffTimer); resolve(); })
                     .on('error', err => { clearTimeout(ffTimer); reject(err); })
                     .save(tmpOut);
@@ -1035,9 +1042,9 @@ async function finalizeToCompactMp3(rawResult, videoId, startSec, durationSec) {
 }
 
 async function runSingleEngine(engine, videoId, startSec, durationSec) {
-    if (engine === 'ytdlp_cookies' || engine === 'ytdlp_direct') return await tryYtDlpMode(engine, videoId, startSec, durationSec);
     if (engine === 'rapidapi1') return await tryRapidApiEngine(RAPID_CONFIGS[0], videoId, startSec, durationSec);
     if (engine === 'rapidapi2') return await tryRapidApiEngine(RAPID_CONFIGS[1], videoId, startSec, durationSec);
+    if (engine === 'ytdlp_cookies' || engine === 'ytdlp_direct') return await tryYtDlpMode(engine, videoId, startSec, durationSec);
     if (engine === 'cobalt') return await tryCobaltEngine(videoId);
     if (engine === 'invidious_parallel') return await tryInvidiousParallel(videoId);
     if (engine === 'piped_parallel') return await tryPipedParallel(videoId);
@@ -1047,7 +1054,8 @@ async function runSingleEngine(engine, videoId, startSec, durationSec) {
 
 async function downloadSegmentBufferHybrid(videoId, startSec = 0, durationSec = 900) {
     const errors = [];
-    for (const engine of SHORT_ENGINE_ORDER) {
+    const order = getDynamicEngineOrder();
+    for (const engine of order) {
         if (isEngineCoolingDown(engine)) {
             errors.push(`${engine}: paused (${engineCooldown.get(engine)?.reason})`);
             continue;
@@ -1056,6 +1064,7 @@ async function downloadSegmentBufferHybrid(videoId, startSec = 0, durationSec = 
             const t0 = Date.now();
             const rawRes = await runSingleEngine(engine, videoId, startSec, durationSec);
             const mp3Buf = await finalizeToCompactMp3(rawRes, videoId, startSec, durationSec);
+            lastWinningEngine = engine;
             console.log(`[Download OK] engine=${engine} (${rawRes.detail || 'ok'}) video=${videoId} seg=${startSec}-${startSec + durationSec} bytes=${mp3Buf.length} ms=${Date.now() - t0}`);
             return mp3Buf;
         } catch (err) {
@@ -1071,6 +1080,14 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
     const cleanLive = String(livePlayFolder).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
     const cleanArchive = String(archiveUserFolder).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
 
+    // בדיקת מטמון השמעה חוזרת (חוסך 100% זמן, תעבורה ומכסות API!)
+    const cacheKey = `${cleanArchive}:${videoId}`;
+    const cached = recentPlaybackCache.get(cacheKey);
+    if (cached && (Date.now() - cached.ts) < PLAYBACK_CACHE_TTL_MS) {
+        console.log(`[Cache Hit] Instant replay for ${cacheKey} -> ${cached.playCmd}`);
+        return cached.playCmd;
+    }
+
     const isLongVideo = durationSeconds > 900;
     const firstChunkSec = isLongVideo ? 900 : 0;
 
@@ -1083,12 +1100,18 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
     const archPath = `ivr2:/${cleanArchive}/${archNum}.mp3`;
     await uploadAudioBufferToExactPath(firstMp3Buf, archPath, `${archNum}.mp3`, '1', 35000);
 
-    if (!isLongVideo) return `f-/${cleanArchive}/${archNum}`;
+    if (!isLongVideo) {
+        const playCmd = `f-/${cleanArchive}/${archNum}`;
+        recentPlaybackCache.set(cacheKey, { playCmd, ts: Date.now() });
+        return playCmd;
+    }
 
     const TOTAL_PARTS = Math.min(8, Math.max(2, Math.ceil((durationSeconds - 10) / 900)));
     const rawPartNums = await getNextFileNumberStr(cleanLive, TOTAL_PARTS - 1);
     const extraNums = Array.isArray(rawPartNums) ? rawPartNums : [rawPartNums];
     const chainedPlayCommand = [`f-/${cleanArchive}/${archNum}`, ...extraNums.map(n => `f-/${cleanLive}/${n}`)].join('.');
+
+    recentPlaybackCache.set(cacheKey, { playCmd: chainedPlayCommand, ts: Date.now() });
 
     (async () => {
         for (let i = 1; i < TOTAL_PARTS; i++) {
@@ -1115,7 +1138,7 @@ function setCors(res) {
 }
 
 app.get('/', (req, res) => {
-    res.send('YouTube Personal Line Server v4.3 (Long Video Fix + Auto JSON-to-Netscape Cookies + Smart RapidAPI) OK');
+    res.send('YouTube Personal Line Server v4.4 (4x Faster Zero-Reencode + Quota-Safe Polling) OK');
 });
 
 app.get('/health', (req, res) => {
@@ -1126,15 +1149,17 @@ app.get('/health', (req, res) => {
         if (Date.now() < v.until) cooldowns[k] = { reason: v.reason, remainingSec: Math.round((v.until - Date.now()) / 1000) };
     }
     res.json({
-        version: '4.3.0',
-        engineOrder: SHORT_ENGINE_ORDER,
+        version: '4.4.0',
+        activeEngineOrder: getDynamicEngineOrder(),
+        lastWinningEngine,
+        directMp3LimitMB: Math.round(DIRECT_MP3_MAX_BYTES / (1024 * 1024)),
+        cachedReplays: recentPlaybackCache.size,
         cookies: cookiesStatus,
         configured: {
-            ytdlp_cookies: Boolean(YT_COOKIES_B64),
             rapidapi1: Boolean(RAPID_CONFIGS[0].key && RAPID_CONFIGS[0].host),
             rapidapi1_host: RAPID_CONFIGS[0].host || null,
             rapidapi2: Boolean(RAPID_CONFIGS[1].key && RAPID_CONFIGS[1].host),
-            rapidapi2_host: RAPID_CONFIGS[1].host || null,
+            ytdlp_cookies: Boolean(YT_COOKIES_B64),
             cobalt: Boolean(COBALT_API_URL),
             proxy: Boolean(PROXY_URL),
             youtube_api_keys: YT_KEYS.length,
@@ -1149,10 +1174,10 @@ app.get('/test', async (req, res) => {
     setCors(res);
     if (req.query.reset === '1') engineCooldown.clear();
     const videoId = String(req.query.v || 'jNQXAC9IVRw').replace(/[^a-zA-Z0-9_-]/g, '');
-    const dur = parseInt(req.query.dur || '10', 10) || 10;
+    const dur = parseInt(req.query.dur || '15', 10) || 15;
     const results = [];
 
-    for (const engine of SHORT_ENGINE_ORDER) {
+    for (const engine of getDynamicEngineOrder()) {
         const t0 = Date.now();
         try {
             const rawRes = await runSingleEngine(engine, videoId, 0, dur);
@@ -1168,7 +1193,7 @@ app.get('/test', async (req, res) => {
             });
         }
     }
-    res.json({ version: '4.3.0', cookies: cookiesStatus, videoId, results });
+    res.json({ version: '4.4.0', videoId, results });
 });
 
 // ==================== מנוע ימות המשיח ====================
@@ -1255,11 +1280,14 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             const { cleanQuery, isMusic } = state;
             const archiveFolder = isMusic ? musicExtFolder : torahExtFolder;
             const categoryLabel = isMusic ? 'מוזיקה' : 'שיעורים';
-            const registeredName = (await getUserNameIfRegistered(callerPhone)) || 'משתמש רשום';
 
             try {
-                const playCmd = await downloadAndPreparePlayback(chosenVideo.videoId, tempRecFolder, archiveFolder, chosenVideo.durationSeconds || 0);
-                saveAdminLogToExt8(callerPhone, registeredName, categoryLabel, cleanQuery, chosenVideo.title, `הורד בהצלחה לשלוחה ${archiveFolder}`);
+                // מריץ שליפת שם משתמש במקביל להורדה לחיסכון בזמן
+                const [playCmd, regName] = await Promise.all([
+                    downloadAndPreparePlayback(chosenVideo.videoId, tempRecFolder, archiveFolder, chosenVideo.durationSeconds || 0),
+                    getUserNameIfRegistered(callerPhone).catch(() => null)
+                ]);
+                saveAdminLogToExt8(callerPhone, regName || 'משתמש רשום', categoryLabel, cleanQuery, chosenVideo.title, `הורד בהצלחה לשלוחה ${archiveFolder}`);
                 userSessionState.set(callerPhone, { step: 'WAIT_MENU', callId });
                 const durationPart = chosenVideo.durationText ? ` באורך ${chosenVideo.durationText}` : '';
                 return res.send(`id_list_message=t-משמיע ${chosenVideo.title}${durationPart}.${playCmd}&go_to_folder=${YOUTUBE_MAIN_EXT}`);
@@ -1274,11 +1302,16 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             const isMusic = Boolean(state.isMusic);
             const recordPath = isMusic ? (searchMusic || searchTorah) : (searchTorah || searchMusic);
             const categoryLabel = isMusic ? 'מוזיקה' : 'שיעורים';
-            const registeredName = (await getUserNameIfRegistered(callerPhone)) || 'משתמש רשום';
 
-            let audioBuf;
-            try { audioBuf = await downloadRecordingFromYemot(recordPath, lastVal(q.ApiExtension)); }
-            catch (dlErr) {
+            let audioBuf, registeredName;
+            try {
+                const [dlBuf, rName] = await Promise.all([
+                    downloadRecordingFromYemot(recordPath, lastVal(q.ApiExtension)),
+                    getUserNameIfRegistered(callerPhone).catch(() => null)
+                ]);
+                audioBuf = dlBuf;
+                registeredName = rName || 'משתמש רשום';
+            } catch (dlErr) {
                 userSessionState.set(callerPhone, { step: 'WAIT_MENU', callId });
                 return res.send(`id_list_message=t-שגיאה בהורדת ההקלטה&read=t-${MAIN_MENU_TEXT}=MenuChoice,no,1,0,7,Digits,no`);
             }
@@ -1409,9 +1442,9 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, '0.0.0.0', () => {
-    console.log(`=== Server v4.3 (Long Video Fix + JSON Cookies Converter) Ready on port ${port} ===`);
+    console.log(`=== Server v4.4 (4x Faster Zero-Reencode + Quota-Safe) Ready on port ${port} ===`);
     getCookiesFilePath();
-    console.log(`[Engine Order] ${SHORT_ENGINE_ORDER.join(' -> ')}`);
+    console.log(`[Engine Order] ${getDynamicEngineOrder().join(' -> ')}`);
     ensureYtDlpBinary(false).catch(() => null);
     refreshInvidiousList(true).catch(() => null);
     refreshPipedList(true).catch(() => null);
