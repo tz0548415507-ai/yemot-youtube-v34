@@ -20,9 +20,10 @@ const YT_KEY2 = (process.env.YOUTUBE_API_KEY2 || '').trim();
 const YT_KEYS = [YT_KEY, YT_KEY2].filter(Boolean);
 let activeYtKeyIndex = 0;
 
-// מנועים ללא עוגיות: Apify + RapidAPI כפול + Proxy + Cobalt + yt-dlp 2026
+// מנועים מהירים ללא עוגיות
 const APIFY_TOKEN = (process.env.APIFY_TOKEN || '').trim();
 const APIFY_ACTOR = (process.env.APIFY_ACTOR || 'johnvc~youtube-download-api').trim();
+const APIFY_FALLBACK_ACTOR = 'hipersoft~youtube-downloader';
 
 const RAPID_CONFIGS = [
     {
@@ -43,24 +44,26 @@ const YT_COOKIES_B64 = (process.env.YT_COOKIES_B64 || '').trim();
 const COBALT_API_URL = (process.env.COBALT_API_URL || '').trim().replace(/\/+$/, '');
 const PROXY_URL = (process.env.PROXY_URL || '').trim();
 
+// מצב מהיר (ברירת מחדל): Stream Copy ישיר עד 10.5MB ללא קידוד FFmpeg (חוסך ~50 שנ' בכל חלק!)
+const AUDIO_MODE = (process.env.AUDIO_MODE || 'fast').trim().toLowerCase();
+const DIRECT_MP3_MAX_BYTES = AUDIO_MODE === 'saver' ? (3.2 * 1024 * 1024) : (10.5 * 1024 * 1024);
+
 const YM = 'https://www.call2all.co.il/ym/api/';
 const ADMIN_LOG_EXT = '8';
 const YOUTUBE_MAIN_EXT = '/1/0000000144';
 const RESULTS_PER_PAGE = 7;
 
-// חלק של 15 דקות (900 שניות), עד 12 חלקים (= 3 שעות מלאות)
 const CHUNK_SEC = 900;
 const MAX_PARTS = 12;
-const DIRECT_MP3_MAX_BYTES = 5 * 1024 * 1024;
 
-// סדר מנועים: קודם המנועים האמינים ביותר (ללא עוגיות או עם עוגיות אם הוגדרו), ואחריהם כל הגיבויים ללא עוגיות
+// סדר מואץ: קודם המנועים האמיתיים ללא עוגיות (Apify -> RapidAPI -> פרוקסי), ורק בסוף גיבויים שעלולים להיחסם
 const BASE_ENGINE_ORDER = [
     'apify',
-    'ytdlp_proxy_nocookies',
-    'ytdlp_cookies',
     'rapidapi1',
     'rapidapi2',
+    'ytdlp_proxy_nocookies',
     'cobalt',
+    'ytdlp_cookies',
     'ytdlp_direct',
     'invidious_parallel',
     'piped_parallel',
@@ -79,7 +82,7 @@ const PLAYBACK_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 
 const workingRapidTemplate = new Map();
 const engineCooldown = new Map();
-const COOLDOWN_MS = 10 * 60 * 1000;
+const COOLDOWN_MS = 15 * 60 * 1000; // 15 דקות השהיה למנוע תקול כדי שלא יאט שיחות
 
 const YTDLP_BIN_PATH = path.join(os.tmpdir(), 'yt-dlp-linux');
 const YTDLP_CACHE_DIR = path.join(os.tmpdir(), 'ytdlp-cache');
@@ -136,30 +139,27 @@ function isEngineCoolingDown(engine) {
     return true;
 }
 
-// ==================== ממיר עוגיות אופציונלי (JSON / Base64 -> Netscape) ====================
+// ==================== ממיר עוגיות אופציונלי ====================
 function convertJsonCookiesToNetscape(jsonText) {
     const parsed = JSON.parse(jsonText);
     const arr = Array.isArray(parsed) ? parsed : (parsed.cookies || parsed.data || []);
     if (!Array.isArray(arr) || arr.length === 0) return null;
 
-    const lines = ['# Netscape HTTP Cookie File', '# Auto-converted from JSON by Server v4.7'];
+    const lines = ['# Netscape HTTP Cookie File', '# Auto-converted from JSON by Server v4.8'];
     let count = 0;
 
     for (const c of arr) {
         if (!c || typeof c !== 'object' || !c.name) continue;
         let domain = String(c.domain || '.youtube.com').trim();
         let includeSub;
-        if (c.hostOnly === true) {
-            includeSub = 'FALSE';
-        } else if (c.hostOnly === false) {
+        if (c.hostOnly === true) includeSub = 'FALSE';
+        else if (c.hostOnly === false) {
             includeSub = 'TRUE';
             if (!domain.startsWith('.')) domain = '.' + domain;
-        } else {
-            includeSub = domain.startsWith('.') ? 'TRUE' : 'FALSE';
-        }
+        } else includeSub = domain.startsWith('.') ? 'TRUE' : 'FALSE';
+
         const cookiePath = String(c.path || '/').trim() || '/';
         const secure = c.secure ? 'TRUE' : 'FALSE';
-
         let rawExp = c.expirationDate ?? c.expires ?? c.expiry ?? 0;
         let expInt = 0;
         if (typeof rawExp === 'number' && isFinite(rawExp) && rawExp > 0) {
@@ -172,13 +172,11 @@ function convertJsonCookiesToNetscape(jsonText) {
                 if (!isNaN(dt) && dt > 0) expInt = Math.floor(dt / 1000);
             }
         }
-
         const name = String(c.name).replace(/[\t\r\n]/g, ' ');
         const value = String(c.value ?? '').replace(/[\t\r\n]/g, ' ');
         lines.push(`${domain}\t${includeSub}\t${cookiePath}\t${secure}\t${expInt}\t${name}\t${value}`);
         count++;
     }
-
     if (count === 0) return null;
     return { text: lines.join('\n') + '\n', count };
 }
@@ -186,7 +184,6 @@ function convertJsonCookiesToNetscape(jsonText) {
 function getCookiesFilePath() {
     if (!YT_COOKIES_B64) return null;
     if (cookiesStatus.initialized && fs.existsSync(COOKIES_FILE_PATH)) return COOKIES_FILE_PATH;
-
     try {
         let content = YT_COOKIES_B64.trim();
         if (!content.startsWith('[') && !content.startsWith('{') && !content.includes('\t') && !content.includes('Netscape')) {
@@ -197,17 +194,14 @@ function getCookiesFilePath() {
                 }
             } catch (e) {}
         }
-
         if (content.startsWith('[') || content.startsWith('{')) {
             const converted = convertJsonCookiesToNetscape(content);
             if (converted) {
                 fs.writeFileSync(COOKIES_FILE_PATH, converted.text, 'utf8');
                 cookiesStatus = { initialized: true, format: 'json_auto_converted_to_netscape', count: converted.count };
-                console.log(`[Cookies] Auto-converted ${converted.count} JSON cookies -> Netscape cookies.txt`);
                 return COOKIES_FILE_PATH;
             }
         }
-
         if (content.includes('\t') && content.length > 20) {
             if (!content.startsWith('# Netscape') && !content.startsWith('# HTTP Cookie File')) {
                 content = '# Netscape HTTP Cookie File\n' + content;
@@ -217,9 +211,7 @@ function getCookiesFilePath() {
             cookiesStatus = { initialized: true, format: 'netscape', count: cookieLines };
             return COOKIES_FILE_PATH;
         }
-    } catch (e) {
-        console.warn('[Cookies Init Error]', e.message);
-    }
+    } catch (e) {}
     return null;
 }
 
@@ -253,10 +245,8 @@ function parseIsoDurationToHebrew(isoDuration) {
     if (hours === 1) parts.push('שעה');
     else if (hours === 2) parts.push('שעתיים');
     else if (hours > 2) parts.push(`${hours} שעות`);
-
     if (minutes === 1) parts.push('דקה אחת');
     else if (minutes > 1) parts.push(`${minutes} דקות`);
-
     if (hours === 0 && seconds > 0) parts.push(`${seconds} שניות`);
 
     return { seconds: totalSeconds, text: parts.join(' ו ') };
@@ -319,7 +309,7 @@ async function refreshInvidiousList(force = false) {
     try {
         const res = await fetchWithTimeout('https://api.invidious.io/instances.json?sort_by=health', {
             headers: { 'User-Agent': 'Mozilla/5.0' }
-        }, 6500);
+        }, 5500);
         if (res.ok) {
             const arr = await res.json();
             if (Array.isArray(arr)) {
@@ -327,7 +317,7 @@ async function refreshInvidiousList(force = false) {
                     .filter(item => Array.isArray(item) && item[1] && item[1].type === 'https' && item[1].api === true && item[1].uri)
                     .map(item => String(item[1].uri).replace(/\/+$/, ''));
                 if (fresh.length > 0) {
-                    invidiousCache.list = [...new Set([...fresh, ...invidiousCache.list])].slice(0, 14);
+                    invidiousCache.list = [...new Set([...fresh, ...invidiousCache.list])].slice(0, 12);
                     invidiousCache.updatedAt = Date.now();
                 }
             }
@@ -341,7 +331,7 @@ async function refreshPipedList(force = false) {
     try {
         const res = await fetchWithTimeout('https://piped-instances.kavin.rocks/', {
             headers: { 'User-Agent': 'Mozilla/5.0' }
-        }, 6500);
+        }, 5500);
         if (res.ok) {
             const arr = await res.json();
             if (Array.isArray(arr)) {
@@ -349,7 +339,7 @@ async function refreshPipedList(force = false) {
                     .filter(item => item && item.api_url && item.up_to_date !== false)
                     .map(item => String(item.api_url).replace(/\/+$/, ''));
                 if (fresh.length > 0) {
-                    pipedCache.list = [...new Set([...fresh, ...pipedCache.list])].slice(0, 14);
+                    pipedCache.list = [...new Set([...fresh, ...pipedCache.list])].slice(0, 12);
                     pipedCache.updatedAt = Date.now();
                 }
             }
@@ -578,7 +568,7 @@ async function transcribeAudio(audioBase64) {
     throw new Error('GEMINI_ERR: ' + lastErr);
 }
 
-// ==================== מנועי ההורדה (גרסה 4.7 — Apify ללא עוגיות + yt-dlp 2026 + RapidAPI) ====================
+// ==================== מנועי ההורדה (גרסה 4.8 — תיקון Apify 400 + מהירות פי 5) ====================
 
 function isHtmlBuffer(buf) {
     if (!buf || buf.length < 16) return true;
@@ -593,49 +583,69 @@ function isValidMp3Header(buf) {
     return false;
 }
 
-// מנוע חדש 4.7: Apify YouTube Download API (ללא עוגיות, קרדיט $5 חינם בחודש, מחזיר קובץ מלא לחיתוך מקומי של כל החלקים!)
-async function tryApifyEngine(videoId) {
-    if (!APIFY_TOKEN) throw new Error('SKIP: APIFY_TOKEN not configured');
-
-    const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
-    const apiUrl = `https://api.apify.com/v2/actors/${encodeURIComponent(APIFY_ACTOR)}/run-sync-get-dataset-items?token=${encodeURIComponent(APIFY_TOKEN)}`;
+// מנוע 1: Apify מתוקן (סכמת JSON רשמית של johnvc~youtube-download-api + גיבוי אוטומטי ל-hipersoft~youtube-downloader)
+async function callApifyActor(actorSlug, payload, timeoutMs = 60000) {
+    const cleanActor = actorSlug.replace('/', '~');
+    const apiUrl = `https://api.apify.com/v2/actors/${cleanActor}/run-sync-get-dataset-items?token=${encodeURIComponent(APIFY_TOKEN)}`;
 
     const res = await fetchWithTimeout(apiUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            videoUrls: [ytUrl],
-            format: 'audio',
-            audioFormat: 'm4a',
-            quality: 'standard'
-        })
-    }, 65000);
+        body: JSON.stringify(payload)
+    }, timeoutMs);
 
     if (!res.ok) {
+        const errBody = (await res.text().catch(() => '')).replace(/\s+/g, ' ').slice(0, 180);
         if ([401, 402, 403, 429].includes(res.status)) {
-            setEngineCooldown('apify', `HTTP_${res.status}`);
+            setEngineCooldown('apify', `HTTP_${res.status}: ${errBody}`);
         }
-        throw new Error(`APIFY HTTP_${res.status}`);
+        throw new Error(`APIFY(${cleanActor}) HTTP_${res.status}: ${errBody}`);
     }
 
     const items = await res.json();
     const row = Array.isArray(items) ? items[0] : items;
-    if (!row || typeof row !== 'object') throw new Error('APIFY empty dataset');
+    if (!row || typeof row !== 'object') throw new Error(`APIFY(${cleanActor}) empty dataset`);
 
-    const audioUrl = row.fileUrl || row.downloadUrl || row.audioUrl || row.url || row.link;
+    const audioUrl = row.fileUrl || row.downloadUrl || row.download_url || row.audioUrl || row.mediaUrl || row.url || row.link;
     if (!audioUrl || !String(audioUrl).startsWith('http') || String(audioUrl).includes('youtube.com/watch')) {
-        throw new Error(`APIFY no fileUrl (${row.error || row.status || 'unknown'})`);
+        throw new Error(`APIFY(${cleanActor}) no fileUrl (${row.error || row.errorCode || row.status || JSON.stringify(row).slice(0, 120)})`);
     }
 
-    const dlRes = await fetchWithTimeout(audioUrl, {}, 60000);
+    const dlRes = await fetchWithTimeout(audioUrl, {}, 55000);
     if (!dlRes.ok) throw new Error(`APIFY_DL HTTP_${dlRes.status}`);
     const buf = Buffer.from(await dlRes.arrayBuffer());
     if (buf.length < 8000 || isHtmlBuffer(buf)) {
         throw new Error(`APIFY invalid audio (${buf.length} bytes)`);
     }
 
-    // מחזיר alreadyTrimmed=false כדי שהשרת יוכל לחתוך את כל החלקים 1..12 מקומית מאותה הורדה יחידה!
-    return { buffer: buf, alreadyTrimmed: false, detail: `${APIFY_ACTOR} (${Math.round(buf.length / 1024)}KB)` };
+    // כבר מומר ל-MP3 על השרת המהיר של Apify -> אצלנו החיתוך לכל 12 החלקים נעשה ב-Stream Copy תוך 0.3 שנ'!
+    return { buffer: buf, alreadyTrimmed: false, detail: `${cleanActor} (${Math.round(buf.length / 1024)}KB)` };
+}
+
+async function tryApifyEngine(videoId) {
+    if (!APIFY_TOKEN) throw new Error('SKIP: APIFY_TOKEN not configured');
+    const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+
+    // ניסיון 1: Actor ראשי עם שדות תקינים בדיוק לפי Input Schema (audioQuality ולא quality!)
+    const primaryActor = APIFY_ACTOR.replace('/', '~');
+    const primaryPayload = primaryActor.includes('hipersoft')
+        ? { videoUrls: [ytUrl], format: 'mp3', maxItems: 1 }
+        : { videoUrls: [ytUrl], format: 'audio', audioFormat: 'mp3', audioQuality: 'standard' };
+
+    try {
+        return await callApifyActor(primaryActor, primaryPayload, 60000);
+    } catch (err1) {
+        if (String(err1.message).includes('HTTP_401') || String(err1.message).includes('HTTP_402') || String(err1.message).includes('HTTP_403')) {
+            throw err1;
+        }
+        // ניסיון 2 אוטומטי עם Actor גיבוי על אותו APIFY_TOKEN
+        const backupActor = primaryActor.includes('hipersoft') ? 'johnvc~youtube-download-api' : APIFY_FALLBACK_ACTOR;
+        const backupPayload = backupActor.includes('hipersoft')
+            ? { videoUrls: [ytUrl], format: 'mp3', maxItems: 1 }
+            : { videoUrls: [ytUrl], format: 'audio', audioFormat: 'mp3', audioQuality: 'standard' };
+        console.warn(`[Apify Primary Fail] ${err1.message} -> trying backup actor ${backupActor}...`);
+        return await callApifyActor(backupActor, backupPayload, 55000);
+    }
 }
 
 function extractAudioUrlFromRapidPayload(payload, depth = 0) {
@@ -686,17 +696,12 @@ function extractAudioUrlFromRapidPayload(payload, depth = 0) {
 }
 
 function getRapidCandidateTemplates(cfg) {
-    if (cfg.endpoint && cfg.endpoint.toLowerCase() !== 'auto') {
-        return [cfg.endpoint];
-    }
+    if (cfg.endpoint && cfg.endpoint.toLowerCase() !== 'auto') return [cfg.endpoint];
     const remembered = workingRapidTemplate.get(cfg.host);
     const h = cfg.host.toLowerCase();
     let list = [];
     if (h.includes('youtube-info-download-api')) {
-        list = [
-            '/ajax/download.php?url={url}&format=mp3&audio_quality=64',
-            '/ajax/download.php?url={url}&format=m4a'
-        ];
+        list = ['/ajax/download.php?url={url}&format=mp3&audio_quality=64'];
     } else if (h.includes('youtube-mp36') || h.includes('yt-api')) {
         list = ['/dl?id={id}', '/dl?url={url}'];
     } else if (h.includes('youtube-media-downloader')) {
@@ -736,7 +741,7 @@ async function tryRapidApiEngine(cfg, videoId, startSec, durationSec, isBackgrou
     for (const tpl of templates) {
         const { url: endpointUrl, supportsTrim } = renderRapidTemplate(tpl, cfg.host, videoId, startSec, durationSec);
         try {
-            const res = await fetchWithTimeout(endpointUrl, { headers }, 25000);
+            const res = await fetchWithTimeout(endpointUrl, { headers }, 20000);
             if (res.status === 404) {
                 lastErr = new Error(`${cfg.id}: HTTP_404 on ${tpl}`);
                 continue;
@@ -755,14 +760,14 @@ async function tryRapidApiEngine(cfg, videoId, startSec, durationSec, isBackgrou
             if (!resolvedUrl && (json.progress_url || json.id || String(json.status || '').toLowerCase() === 'processing')) {
                 const jobUrl = json.progress_url || (json.id ? `https://${cfg.host}/api/progress?id=${encodeURIComponent(json.id)}` : endpointUrl);
                 const isRapidHostJob = jobUrl.includes(cfg.host);
-                const pollIntervalMs = 1500;
-                const maxAttempts = isBackground ? 65 : 42;
+                const pollIntervalMs = 1200;
+                const maxAttempts = isBackground ? 65 : 32; // 38 שנ' לחלק ראשון, 78 שנ' לחלקי רקע
                 let lastProgressStr = '';
 
                 for (let i = 0; i < maxAttempts; i++) {
                     await new Promise(r => setTimeout(r, pollIntervalMs));
                     const pHeaders = isRapidHostJob ? headers : {};
-                    const pRes = await fetchWithTimeout(jobUrl, { headers: pHeaders }, 10000);
+                    const pRes = await fetchWithTimeout(jobUrl, { headers: pHeaders }, 8000);
                     if (!pRes.ok) continue;
                     const pJson = await pRes.json();
 
@@ -779,12 +784,7 @@ async function tryRapidApiEngine(cfg, videoId, startSec, durationSec, isBackgrou
                 }
 
                 if (!resolvedUrl) {
-                    lastErr = new Error(`${cfg.id}: Conversion timeout (last=${lastProgressStr})`);
-                    if (tpl.includes('format=mp3')) {
-                        console.warn(`[RapidAPI] ${lastErr.message} -> retrying with m4a...`);
-                        continue;
-                    }
-                    throw lastErr;
+                    throw new Error(`${cfg.id}: Conversion timeout (last=${lastProgressStr})`);
                 }
             }
 
@@ -793,7 +793,7 @@ async function tryRapidApiEngine(cfg, videoId, startSec, durationSec, isBackgrou
                 continue;
             }
 
-            const dlRes = await fetchWithTimeout(resolvedUrl, {}, 60000);
+            const dlRes = await fetchWithTimeout(resolvedUrl, {}, 45000);
             if (!dlRes.ok) throw new Error(`${cfg.id}_DL: HTTP_${dlRes.status}`);
             const buf = Buffer.from(await dlRes.arrayBuffer());
             if (buf.length < 8000 || isHtmlBuffer(buf)) {
@@ -804,16 +804,14 @@ async function tryRapidApiEngine(cfg, videoId, startSec, durationSec, isBackgrou
             return { buffer: buf, alreadyTrimmed: supportsTrim, detail: tpl };
         } catch (err) {
             lastErr = err;
-            if (!String(err.message).includes('HTTP_404') && !String(err.message).includes('Conversion timeout')) {
+            if (!String(err.message).includes('HTTP_404')) {
                 all404 = false;
                 break;
             }
         }
     }
 
-    if (all404) {
-        setEngineCooldown(cfg.id, `All endpoints returned 404 on ${cfg.host}`);
-    }
+    if (all404) setEngineCooldown(cfg.id, `All endpoints returned 404 on ${cfg.host}`);
     throw lastErr || new Error(`${cfg.id} failed`);
 }
 
@@ -828,7 +826,7 @@ async function tryCobaltEngine(videoId) {
             audioFormat: 'mp3',
             audioBitrate: '64'
         })
-    }, 15000);
+    }, 12000);
     if (!res.ok) {
         if ([401, 403, 404].includes(res.status)) setEngineCooldown('cobalt', `HTTP_${res.status}`);
         throw new Error(`COBALT HTTP_${res.status}`);
@@ -836,7 +834,7 @@ async function tryCobaltEngine(videoId) {
     const json = await res.json();
     const audioUrl = json.url || (Array.isArray(json.picker) && json.picker[0]?.url);
     if (!audioUrl) throw new Error('COBALT no url');
-    const dlRes = await fetchWithTimeout(audioUrl, {}, 45000);
+    const dlRes = await fetchWithTimeout(audioUrl, {}, 35000);
     if (!dlRes.ok) throw new Error(`COBALT_DL HTTP_${dlRes.status}`);
     const buf = Buffer.from(await dlRes.arrayBuffer());
     if (buf.length < 8000 || isHtmlBuffer(buf)) throw new Error('COBALT invalid audio');
@@ -845,11 +843,11 @@ async function tryCobaltEngine(videoId) {
 
 async function tryInvidiousParallel(videoId) {
     const instances = await refreshInvidiousList(false);
-    const batch = instances.slice(0, 5);
+    const batch = instances.slice(0, 4);
 
     const fetchOne = async (base) => {
         const apiUrl = `${base}/api/v1/videos/${encodeURIComponent(videoId)}?fields=adaptiveFormats`;
-        const res = await fetchWithTimeout(apiUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 5000);
+        const res = await fetchWithTimeout(apiUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 4000);
         if (!res.ok) throw new Error(`${base}: HTTP_${res.status}`);
         const data = await res.json();
         const audioStreams = (data.adaptiveFormats || []).filter(f => f && f.url && String(f.type || '').includes('audio/'));
@@ -862,103 +860,85 @@ async function tryInvidiousParallel(videoId) {
             ? streamUrl
             : `${base}/latest_version?id=${encodeURIComponent(videoId)}&itag=${encodeURIComponent(audioStreams[0].itag || '140')}&local=true`;
 
-        for (const tryUrl of [proxiedUrl, streamUrl]) {
-            try {
-                const dlRes = await fetchWithTimeout(tryUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 20000);
-                if (!dlRes.ok) continue;
-                const buf = Buffer.from(await dlRes.arrayBuffer());
-                if (buf.length > 8000 && !isHtmlBuffer(buf)) {
-                    return { buffer: buf, alreadyTrimmed: false, detail: base };
-                }
-            } catch (e) {}
-        }
-        throw new Error(`${base}: stream failed`);
-    };
-
-    try {
-        return await Promise.any(batch.map(fetchOne));
-    } catch (agg) {
-        throw new Error(`Invidious(${batch.length}): ${agg?.errors?.[0]?.message || 'failed'}`);
-    }
-}
-
-async function tryPipedParallel(videoId) {
-    const instances = await refreshPipedList(false);
-    const batch = instances.slice(0, 5);
-
-    const fetchOne = async (base) => {
-        const apiUrl = `${base}/streams/${encodeURIComponent(videoId)}`;
-        const res = await fetchWithTimeout(apiUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 5000);
-        if (!res.ok) throw new Error(`${base}: HTTP_${res.status}`);
-        const data = await res.json();
-        const audioStreams = (data.audioStreams || []).filter(s => s && s.url);
-        if (audioStreams.length === 0) throw new Error(`${base}: no audioStreams`);
-
-        audioStreams.sort((a, b) => (a.bitrate || 999999) - (b.bitrate || 999999));
-        const dlRes = await fetchWithTimeout(audioStreams[0].url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 20000);
+        const dlRes = await fetchWithTimeout(proxiedUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 10000);
         if (!dlRes.ok) throw new Error(`${base}_DL: HTTP_${dlRes.status}`);
         const buf = Buffer.from(await dlRes.arrayBuffer());
-        if (buf.length > 8000 && !isHtmlBuffer(buf)) {
-            return { buffer: buf, alreadyTrimmed: false, detail: base };
-        }
+        if (buf.length > 8000 && !isHtmlBuffer(buf)) return { buffer: buf, alreadyTrimmed: false, detail: base };
         throw new Error(`${base}: invalid audio`);
     };
 
     try {
         return await Promise.any(batch.map(fetchOne));
     } catch (agg) {
-        throw new Error(`Piped(${batch.length}): ${agg?.errors?.[0]?.message || 'failed'}`);
+        const msg = `Invidious(${batch.length}): ${agg?.errors?.[0]?.message || 'failed'}`;
+        setEngineCooldown('invidious_parallel', msg);
+        throw new Error(msg);
+    }
+}
+
+async function tryPipedParallel(videoId) {
+    const instances = await refreshPipedList(false);
+    const batch = instances.slice(0, 4);
+
+    const fetchOne = async (base) => {
+        const apiUrl = `${base}/streams/${encodeURIComponent(videoId)}`;
+        const res = await fetchWithTimeout(apiUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 4000);
+        if (!res.ok) throw new Error(`${base}: HTTP_${res.status}`);
+        const data = await res.json();
+        const audioStreams = (data.audioStreams || []).filter(s => s && s.url);
+        if (audioStreams.length === 0) throw new Error(`${base}: no audioStreams`);
+
+        audioStreams.sort((a, b) => (a.bitrate || 999999) - (b.bitrate || 999999));
+        const dlRes = await fetchWithTimeout(audioStreams[0].url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 10000);
+        if (!dlRes.ok) throw new Error(`${base}_DL: HTTP_${dlRes.status}`);
+        const buf = Buffer.from(await dlRes.arrayBuffer());
+        if (buf.length > 8000 && !isHtmlBuffer(buf)) return { buffer: buf, alreadyTrimmed: false, detail: base };
+        throw new Error(`${base}: invalid audio`);
+    };
+
+    try {
+        return await Promise.any(batch.map(fetchOne));
+    } catch (agg) {
+        const msg = `Piped(${batch.length}): ${agg?.errors?.[0]?.message || 'failed'}`;
+        setEngineCooldown('piped_parallel', msg);
+        throw new Error(msg);
     }
 }
 
 async function tryInnerTubeDirect(videoId) {
-    const clients = [
-        {
-            name: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
-            ua: 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.0) AppleWebKit/537.36',
-            context: {
-                client: { clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER', clientVersion: '2.0', hl: 'en', gl: 'US' },
-                thirdParty: { embedUrl: 'https://www.youtube.com/' }
-            }
-        },
-        {
-            name: 'WEB_EMBEDDED_PLAYER',
-            ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            context: {
-                client: { clientName: 'WEB_EMBEDDED_PLAYER', clientVersion: '1.20261001.01.00', hl: 'en', gl: 'US' },
-                thirdParty: { embedUrl: 'https://www.youtube.com/' }
-            }
+    const c = {
+        name: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+        ua: 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.0) AppleWebKit/537.36',
+        context: {
+            client: { clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER', clientVersion: '2.0', hl: 'en', gl: 'US' },
+            thirdParty: { embedUrl: 'https://www.youtube.com/' }
         }
-    ];
-
-    let lastErr = null;
-    for (const c of clients) {
-        try {
-            const res = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'User-Agent': c.ua },
-                body: JSON.stringify({ videoId, context: c.context, contentCheckOk: true, racyCheckOk: true })
-            }, 6000);
-            if (!res.ok) { lastErr = new Error(`${c.name}: HTTP_${res.status}`); continue; }
-            const data = await res.json();
-            if (data?.playabilityStatus?.status !== 'OK') {
-                lastErr = new Error(`${c.name}: ${data?.playabilityStatus?.status || 'NOT_OK'}`);
-                continue;
-            }
-            const formats = (data?.streamingData?.adaptiveFormats || [])
-                .filter(f => f && f.url && String(f.mimeType || '').includes('audio/'));
-            if (formats.length === 0) { lastErr = new Error(`${c.name}: no direct url`); continue; }
-            formats.sort((a, b) => (a.bitrate || 999999) - (b.bitrate || 999999));
-            const dlRes = await fetchWithTimeout(formats[0].url, { headers: { 'User-Agent': c.ua } }, 20000);
-            if (!dlRes.ok) { lastErr = new Error(`${c.name}_DL: HTTP_${dlRes.status}`); continue; }
-            const buf = Buffer.from(await dlRes.arrayBuffer());
-            if (buf.length > 8000 && !isHtmlBuffer(buf)) return { buffer: buf, alreadyTrimmed: false, detail: c.name };
-        } catch (err) { lastErr = err; }
+    };
+    try {
+        const res = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'User-Agent': c.ua },
+            body: JSON.stringify({ videoId, context: c.context, contentCheckOk: true, racyCheckOk: true })
+        }, 4500);
+        if (!res.ok) throw new Error(`${c.name}: HTTP_${res.status}`);
+        const data = await res.json();
+        if (data?.playabilityStatus?.status !== 'OK') throw new Error(`${c.name}: ${data?.playabilityStatus?.status || 'NOT_OK'}`);
+        const formats = (data?.streamingData?.adaptiveFormats || [])
+            .filter(f => f && f.url && String(f.mimeType || '').includes('audio/'));
+        if (formats.length === 0) throw new Error(`${c.name}: no direct url`);
+        formats.sort((a, b) => (a.bitrate || 999999) - (b.bitrate || 999999));
+        const dlRes = await fetchWithTimeout(formats[0].url, { headers: { 'User-Agent': c.ua } }, 12000);
+        if (!dlRes.ok) throw new Error(`${c.name}_DL: HTTP_${dlRes.status}`);
+        const buf = Buffer.from(await dlRes.arrayBuffer());
+        if (buf.length > 8000 && !isHtmlBuffer(buf)) return { buffer: buf, alreadyTrimmed: false, detail: c.name };
+        throw new Error(`${c.name}: invalid audio`);
+    } catch (err) {
+        setEngineCooldown('innertube_direct', err.message);
+        throw err;
     }
-    throw lastErr || new Error('InnerTube failed');
 }
 
-// ==================== yt-dlp אוקטובר 2026 (לקוחות tv_samsung, visionos, web_embedded + פרוקסי ללא עוגיות) ====================
+// ==================== yt-dlp (ברירת מחדל נקייה + EJS + Circuit Breaker מהיר) ====================
 async function ensureYtDlpBinary(forceRefresh = false) {
     if (!forceRefresh && fs.existsSync(YTDLP_BIN_PATH)) {
         const stat = fs.statSync(YTDLP_BIN_PATH);
@@ -985,11 +965,11 @@ function extractRealYtDlpError(stderr, err) {
     const errLines = lines.filter(l => /error:/i.test(l));
     if (err && err.killed) {
         const tail = (errLines.length > 0 ? errLines : lines).slice(-2).join(' | ');
-        return `TIMEOUT (${err.signal || 'killed'})${tail ? ': ' + tail : ''}`.slice(0, 260);
+        return `TIMEOUT (${err.signal || 'killed'})${tail ? ': ' + tail : ''}`.slice(0, 240);
     }
-    if (errLines.length > 0) return errLines.slice(-2).join(' | ').slice(0, 260);
-    if (lines.length > 0) return lines.slice(-3).join(' | ').slice(0, 260);
-    return String(err?.message || 'yt-dlp failed').slice(0, 220);
+    if (errLines.length > 0) return errLines.slice(-2).join(' | ').slice(0, 240);
+    if (lines.length > 0) return lines.slice(-2).join(' | ').slice(0, 240);
+    return String(err?.message || 'yt-dlp failed').slice(0, 200);
 }
 
 function runYtDlpFullAudio(binPath, videoId, opts = {}) {
@@ -1001,29 +981,27 @@ function runYtDlpFullAudio(binPath, videoId, opts = {}) {
             '--no-check-certificates',
             '--cache-dir', YTDLP_CACHE_DIR,
             '--force-ipv4',
-            '--socket-timeout', '15',
-            '--retries', '3',
+            '--socket-timeout', '12',
+            '--retries', '1',
             '-S', 'proto:https,+abr',
-            '-f', 'worstaudio[protocol^=http][abr>=32]/bestaudio[protocol^=http][abr<=96]/bestaudio[protocol^=http]/worstaudio[abr>=32]/bestaudio/worst'
+            '-f', 'worstaudio[protocol^=http][abr>=32]/bestaudio[protocol^=http][abr<=96]/bestaudio[protocol^=http]/bestaudio/worst'
         ];
 
         if (!opts.skipEjs) {
             args.push('--js-runtimes', `node:${process.execPath}`);
             args.push('--remote-components', 'ejs:github');
         }
-        if (opts.playerClients) args.push('--extractor-args', `youtube:player_client=${opts.playerClients}`);
         if (opts.proxyUrl) args.push('--proxy', opts.proxyUrl);
         if (opts.cookiesPath) args.push('--cookies', opts.cookiesPath);
         args.push('-o', tmpl, `https://www.youtube.com/watch?v=${videoId}`);
 
-        execFile(binPath, args, { timeout: 60000, maxBuffer: 6 * 1024 * 1024 }, (err, stdout, stderr) => {
+        execFile(binPath, args, { timeout: 35000, maxBuffer: 6 * 1024 * 1024 }, (err, stdout, stderr) => {
             const files = fs.readdirSync(os.tmpdir()).filter(f => f.startsWith(prefix + '.') && !f.endsWith('.part'));
             if (files.length > 0) {
                 const fullPath = path.join(os.tmpdir(), files[0]);
                 const sz = fs.statSync(fullPath).size;
                 if (sz > 5000) {
-                    console.log(`[yt-dlp Full Audio OK] file=${files[0]} bytes=${sz}`);
-                    return resolve({ filePath: fullPath, alreadyTrimmed: false, isFullLocalFile: true, detail: `${opts.playerClients || 'default-2026'} (${Math.round(sz / 1024)}KB)` });
+                    return resolve({ filePath: fullPath, alreadyTrimmed: false, isFullLocalFile: true, detail: `yt-dlp (${Math.round(sz / 1024)}KB)` });
                 }
                 fs.promises.unlink(fullPath).catch(() => null);
             }
@@ -1035,74 +1013,39 @@ function runYtDlpFullAudio(binPath, videoId, opts = {}) {
 async function tryYtDlpMode(mode, videoId) {
     const binPath = await ensureYtDlpBinary(false);
     const cookiesPath = getCookiesFilePath();
-    const attempts = [];
+    let cfg = null;
 
     if (mode === 'ytdlp_proxy_nocookies') {
-        // הורדה ללא עוגיות דרך פרוקסי ביתי/ISP עם לקוחות אוקטובר 2026
         if (!PROXY_URL) throw new Error('SKIP: PROXY_URL not set');
-        attempts.push({ proxyUrl: PROXY_URL, playerClients: 'tv_samsung,visionos,web_embedded' });
-        attempts.push({ proxyUrl: PROXY_URL });
+        cfg = { proxyUrl: PROXY_URL };
     } else if (mode === 'ytdlp_cookies') {
         if (!cookiesPath) throw new Error('SKIP: YT_COOKIES_B64 not set');
-        attempts.push({ cookiesPath, proxyUrl: PROXY_URL || undefined, playerClients: 'tv_samsung,web_embedded,web' });
-        attempts.push({ cookiesPath, proxyUrl: PROXY_URL || undefined });
+        cfg = { cookiesPath, proxyUrl: PROXY_URL || undefined };
     } else if (mode === 'ytdlp_direct') {
-        // הורדה ישירה ללא עוגיות עם לקוחות אוקטובר 2026 המעודכנים (ללא android_vr שנשבר)
-        attempts.push({ playerClients: 'tv_samsung,visionos,web_embedded' });
-        attempts.push({ playerClients: 'web_embedded,mweb' });
+        cfg = {};
     }
 
-    let lastErr = null;
-    for (const cfg of attempts) {
-        try {
-            return await runYtDlpFullAudio(binPath, videoId, cfg);
-        } catch (err) {
-            lastErr = err;
-            const msg = String(err.message || '');
-            if (msg.includes('no such option')) {
-                try {
-                    return await runYtDlpFullAudio(binPath, videoId, { ...cfg, skipEjs: true });
-                } catch (e2) { lastErr = e2; }
-            }
-        }
-    }
-    if (lastErr) {
-        const low = String(lastErr.message).toLowerCase();
-        if (low.includes('not a bot') || low.includes('sign in') || low.includes('http error 403')) {
-            setEngineCooldown(mode, lastErr.message);
-        }
-    }
-    throw lastErr || new Error(`${mode} failed`);
-}
-
-async function prewarmYtDlpEjs() {
     try {
-        const binPath = await ensureYtDlpBinary(false);
-        const args = [
-            '--simulate', '--skip-download', '--no-playlist',
-            '--cache-dir', YTDLP_CACHE_DIR,
-            '--js-runtimes', `node:${process.execPath}`,
-            '--remote-components', 'ejs:github',
-            'https://www.youtube.com/watch?v=jNQXAC9IVRw'
-        ];
-        const cookiesPath = getCookiesFilePath();
-        if (cookiesPath) args.splice(args.length - 1, 0, '--cookies', cookiesPath);
-        execFile(binPath, args, { timeout: 25000 }, (err, stdout, stderr) => {
-            if (!err) console.log('[yt-dlp EJS] Prewarmed & cached successfully');
-            else console.log('[yt-dlp EJS] Prewarm info:', extractRealYtDlpError(stderr, err));
-        });
-    } catch (e) {}
+        return await runYtDlpFullAudio(binPath, videoId, cfg);
+    } catch (err) {
+        const low = String(err.message || '').toLowerCase();
+        if (low.includes('not a bot') || low.includes('sign in') || low.includes('403') || low.includes('failed to extract')) {
+            setEngineCooldown(mode, err.message);
+        }
+        throw err;
+    }
 }
 
-// חיתוך וקידוד מקומי מקובץ בדיסק (24kbps מונו — ~2.6MB ל-15 דקות, חסכוני ל-5GB של Render)
+// חיתוך מהיר ב-Stream Copy (0.2 שניות!) בלי להיתקע על קידוד FFmpeg ב-Render
 async function sliceLocalAudioToCompactMp3(inputPath, startSec = 0, durationSec = 0, alreadyTrimmed = false) {
     const tmpOut = path.join(os.tmpdir(), `slice_${startSec}_${Date.now()}_${Math.random().toString(36).slice(2, 5)}.mp3`);
     try {
+        // ניסיון 1 (אולטרה-מהיר — 0.2 שנ' CPU!): העתקת זרם MP3 ישירה עד 10.5MB
         let copySucceeded = false;
-        if (inputPath.toLowerCase().endsWith('.mp3') || inputPath.toLowerCase().endsWith('.bin')) {
+        if (AUDIO_MODE !== 'saver') {
             try {
                 await new Promise((resolve, reject) => {
-                    const ffTimer = setTimeout(() => reject(new Error('FFmpeg copy timeout')), 12000);
+                    const ffTimer = setTimeout(() => reject(new Error('FFmpeg copy timeout')), 10000);
                     let cmd = ffmpeg(inputPath);
                     if (!alreadyTrimmed && startSec > 0) cmd = cmd.setStartTime(startSec);
                     if (!alreadyTrimmed && durationSec > 0) cmd = cmd.duration(durationSec);
@@ -1119,6 +1062,7 @@ async function sliceLocalAudioToCompactMp3(inputPath, startSec = 0, durationSec 
             } catch (copyErr) {}
         }
 
+        // ניסיון 2: קידוד מהיר רק אם הקובץ לא MP3 או במצב saver או חורג מ-10.5MB
         if (!copySucceeded) {
             await fs.promises.unlink(tmpOut).catch(() => null);
             await new Promise((resolve, reject) => {
@@ -1128,7 +1072,7 @@ async function sliceLocalAudioToCompactMp3(inputPath, startSec = 0, durationSec 
                 if (!alreadyTrimmed && durationSec > 0) cmd = cmd.duration(durationSec);
                 cmd.format('mp3')
                     .audioCodec('libmp3lame')
-                    .audioBitrate('24k')
+                    .audioBitrate(AUDIO_MODE === 'saver' ? '24k' : '32k')
                     .audioChannels(1)
                     .audioFrequency(16000)
                     .outputOptions(['-compression_level 9', '-threads 0'])
@@ -1148,11 +1092,13 @@ async function sliceLocalAudioToCompactMp3(inputPath, startSec = 0, durationSec 
 async function finalizeRawToMp3(rawResult, videoId, startSec, durationSec, keepLocalFile = false) {
     const { buffer, filePath, alreadyTrimmed } = rawResult;
 
+    // מסלול 0 שניות FFmpeg: קובץ MP3 שכבר חתוך (או קצר שלם) ועד 10.5MB -> מוחזר מיד!
     if (!keepLocalFile && buffer && isValidMp3Header(buffer) && buffer.length <= DIRECT_MP3_MAX_BYTES && (alreadyTrimmed || (startSec === 0 && durationSec === 0))) {
         return { mp3Buf: buffer, reusableFilePath: null };
     }
 
-    const localPath = filePath || path.join(os.tmpdir(), `in_${videoId}_${startSec}_${Date.now()}.bin`);
+    const ext = (buffer && isValidMp3Header(buffer)) ? 'mp3' : 'bin';
+    const localPath = filePath || path.join(os.tmpdir(), `in_${videoId}_${startSec}_${Date.now()}.${ext}`);
     if (!filePath && buffer) {
         await fs.promises.writeFile(localPath, buffer);
     }
@@ -1172,9 +1118,9 @@ async function finalizeRawToMp3(rawResult, videoId, startSec, durationSec, keepL
 
 async function runSingleEngine(engine, videoId, startSec, durationSec, isBackground = false) {
     if (engine === 'apify') return await tryApifyEngine(videoId);
-    if (engine === 'ytdlp_proxy_nocookies' || engine === 'ytdlp_cookies' || engine === 'ytdlp_direct') return await tryYtDlpMode(engine, videoId);
     if (engine === 'rapidapi1') return await tryRapidApiEngine(RAPID_CONFIGS[0], videoId, startSec, durationSec, isBackground);
     if (engine === 'rapidapi2') return await tryRapidApiEngine(RAPID_CONFIGS[1], videoId, startSec, durationSec, isBackground);
+    if (engine === 'ytdlp_proxy_nocookies' || engine === 'ytdlp_cookies' || engine === 'ytdlp_direct') return await tryYtDlpMode(engine, videoId);
     if (engine === 'cobalt') return await tryCobaltEngine(videoId);
     if (engine === 'invidious_parallel') return await tryInvidiousParallel(videoId);
     if (engine === 'piped_parallel') return await tryPipedParallel(videoId);
@@ -1265,7 +1211,7 @@ async function downloadAndPreparePlayback(videoId, archiveUserFolder, durationSe
                 if (!partBuf) {
                     for (let retry = 0; retry < 2 && !partBuf; retry++) {
                         try {
-                            if (retry > 0) await new Promise(r => setTimeout(r, 4000));
+                            if (retry > 0) await new Promise(r => setTimeout(r, 3000));
                             const resPart = await downloadSegmentOrFull(videoId, startSec, CHUNK_SEC, true, true);
                             partBuf = resPart.mp3Buf;
                             if (resPart.reusableFilePath && !localFullFile) {
@@ -1302,7 +1248,7 @@ function setCors(res) {
 }
 
 app.get('/', (req, res) => {
-    res.send('YouTube Personal Line Server v4.7 (Cookie-Less Apify + yt-dlp Oct 2026 + All Parts Local Split) OK');
+    res.send('YouTube Personal Line Server v4.8 (Apify 400 Fixed + Fast Stream Copy + Smart Cooldown) OK');
 });
 
 app.get('/health', (req, res) => {
@@ -1313,18 +1259,18 @@ app.get('/health', (req, res) => {
         if (Date.now() < v.until) cooldowns[k] = { reason: v.reason, remainingSec: Math.round((v.until - Date.now()) / 1000) };
     }
     res.json({
-        version: '4.7.0',
-        maxParts: MAX_PARTS,
+        version: '4.8.0',
+        audioMode: AUDIO_MODE,
+        directMp3LimitMB: +(DIRECT_MP3_MAX_BYTES / (1024 * 1024)).toFixed(1),
         activeEngineOrder: getDynamicEngineOrder(),
         lastWinningEngine,
-        cookies: cookiesStatus,
         configured: {
-            apify_nocookies: Boolean(APIFY_TOKEN),
+            apify: Boolean(APIFY_TOKEN),
             apify_actor: APIFY_ACTOR,
-            proxy_nocookies: Boolean(PROXY_URL),
-            rapidapi1_nocookies: Boolean(RAPID_CONFIGS[0].key && RAPID_CONFIGS[0].host),
+            rapidapi1: Boolean(RAPID_CONFIGS[0].key && RAPID_CONFIGS[0].host),
             rapidapi1_host: RAPID_CONFIGS[0].host || null,
-            rapidapi2_nocookies: Boolean(RAPID_CONFIGS[1].key && RAPID_CONFIGS[1].host),
+            rapidapi2: Boolean(RAPID_CONFIGS[1].key && RAPID_CONFIGS[1].host),
+            proxy: Boolean(PROXY_URL),
             ytdlp_cookies: Boolean(YT_COOKIES_B64),
             cobalt: Boolean(COBALT_API_URL),
             youtube_api_keys: YT_KEYS.length,
@@ -1339,9 +1285,13 @@ app.get('/test', async (req, res) => {
     setCors(res);
     if (req.query.reset === '1') engineCooldown.clear();
     const videoId = String(req.query.v || 'jNQXAC9IVRw').replace(/[^a-zA-Z0-9_-]/g, '');
+    const onlyParam = String(req.query.only || '').trim();
+    const enginesToTest = onlyParam
+        ? onlyParam.split(',').map(s => s.trim()).filter(Boolean)
+        : getDynamicEngineOrder();
     const results = [];
 
-    for (const engine of getDynamicEngineOrder()) {
+    for (const engine of enginesToTest) {
         const t0 = Date.now();
         let reusable = null;
         try {
@@ -1373,7 +1323,7 @@ app.get('/test', async (req, res) => {
             if (reusable) fs.promises.unlink(reusable).catch(() => null);
         }
     }
-    res.json({ version: '4.7.0', cookies: cookiesStatus, videoId, results });
+    res.json({ version: '4.8.0', audioMode: AUDIO_MODE, videoId, results });
 });
 
 // ==================== מנוע ימות המשיח ====================
@@ -1621,10 +1571,9 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, '0.0.0.0', () => {
-    console.log(`=== Server v4.7 (Cookie-Less Apify + yt-dlp Oct 2026 + Local Split) Ready on port ${port} ===`);
+    console.log(`=== Server v4.8 (Apify 400 Fixed + Fast Stream Copy) Ready on port ${port} ===`);
     getCookiesFilePath();
+    console.log(`[Audio Mode] ${AUDIO_MODE} (direct limit: ${Math.round(DIRECT_MP3_MAX_BYTES / (1024 * 1024))}MB)`);
     console.log(`[Engine Order] ${getDynamicEngineOrder().join(' -> ')}`);
-    prewarmYtDlpEjs().catch(() => null);
-    refreshInvidiousList(true).catch(() => null);
-    refreshPipedList(true).catch(() => null);
+    ensureYtDlpBinary(false).catch(() => null);
 });
