@@ -18,5 +18,21 @@ services:
         sync: false
       - key: YEMOT_TOKEN
         sync: false
+      - key: RAPIDAPI_KEY
+        sync: false
+      - key: RAPIDAPI_HOST
+        value: "youtube-info-download-api.p.rapidapi.com"
+      - key: RAPIDAPI_ENDPOINT
+        value: "auto"
+      - key: RAPIDAPI_KEY2
+        sync: false
+      - key: RAPIDAPI_HOST2
+        sync: false
+      - key: RAPIDAPI_ENDPOINT2
+        value: "auto"
       - key: YT_COOKIES_B64
+        sync: false
+      - key: COBALT_API_URL
+        sync: false
+      - key: PROXY_URL
         sync: false
