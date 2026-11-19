@@ -20,6 +20,10 @@ const YT_KEY2 = (process.env.YOUTUBE_API_KEY2 || '').trim();
 const YT_KEYS = [YT_KEY, YT_KEY2].filter(Boolean);
 let activeYtKeyIndex = 0;
 
+// מנועים ללא עוגיות: Apify + RapidAPI כפול + Proxy + Cobalt + yt-dlp 2026
+const APIFY_TOKEN = (process.env.APIFY_TOKEN || '').trim();
+const APIFY_ACTOR = (process.env.APIFY_ACTOR || 'johnvc~youtube-download-api').trim();
+
 const RAPID_CONFIGS = [
     {
         id: 'rapidapi1',
@@ -44,18 +48,23 @@ const ADMIN_LOG_EXT = '8';
 const YOUTUBE_MAIN_EXT = '/1/0000000144';
 const RESULTS_PER_PAGE = 7;
 
-// איזון מהירות ותעבורה (מכסת 5GB של Render): קבצי MP3 עד 10MB עולים ישירות; מעל זה מקודד ל-32k מונו (~3.5MB ל-15 דק')
-const DIRECT_MP3_MAX_BYTES = 10 * 1024 * 1024;
+// חלק של 15 דקות (900 שניות), עד 12 חלקים (= 3 שעות מלאות)
+const CHUNK_SEC = 900;
+const MAX_PARTS = 12;
+const DIRECT_MP3_MAX_BYTES = 5 * 1024 * 1024;
 
+// סדר מנועים: קודם המנועים האמינים ביותר (ללא עוגיות או עם עוגיות אם הוגדרו), ואחריהם כל הגיבויים ללא עוגיות
 const BASE_ENGINE_ORDER = [
-    'rapidapi1',
+    'apify',
+    'ytdlp_proxy_nocookies',
     'ytdlp_cookies',
+    'rapidapi1',
     'rapidapi2',
     'cobalt',
+    'ytdlp_direct',
     'invidious_parallel',
     'piped_parallel',
-    'innertube_direct',
-    'ytdlp_direct'
+    'innertube_direct'
 ];
 let lastWinningEngine = null;
 
@@ -65,7 +74,6 @@ const userNamesCache = new Map();
 const configuredPlayfileDirs = new Set();
 const userSessionState = new Map();
 
-// מטמון השמעה חוזרת (שעתיים) — חוסך 100% זמן, תעבורת Render ומכסות API
 const recentPlaybackCache = new Map();
 const PLAYBACK_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 
@@ -128,13 +136,13 @@ function isEngineCoolingDown(engine) {
     return true;
 }
 
-// ==================== ממיר עוגיות אוטומטי (JSON / Base64 -> Netscape) ====================
+// ==================== ממיר עוגיות אופציונלי (JSON / Base64 -> Netscape) ====================
 function convertJsonCookiesToNetscape(jsonText) {
     const parsed = JSON.parse(jsonText);
     const arr = Array.isArray(parsed) ? parsed : (parsed.cookies || parsed.data || []);
     if (!Array.isArray(arr) || arr.length === 0) return null;
 
-    const lines = ['# Netscape HTTP Cookie File', '# Auto-converted from JSON by Server v4.5'];
+    const lines = ['# Netscape HTTP Cookie File', '# Auto-converted from JSON by Server v4.7'];
     let count = 0;
 
     for (const c of arr) {
@@ -570,7 +578,7 @@ async function transcribeAudio(audioBase64) {
     throw new Error('GEMINI_ERR: ' + lastErr);
 }
 
-// ==================== מנועי ההורדה (גרסה 4.5 — תיקון EJS + RapidAPI) ====================
+// ==================== מנועי ההורדה (גרסה 4.7 — Apify ללא עוגיות + yt-dlp 2026 + RapidAPI) ====================
 
 function isHtmlBuffer(buf) {
     if (!buf || buf.length < 16) return true;
@@ -583,6 +591,51 @@ function isValidMp3Header(buf) {
     if (buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) return true;
     if (buf[0] === 0xFF && (buf[1] & 0xE0) === 0xE0) return true;
     return false;
+}
+
+// מנוע חדש 4.7: Apify YouTube Download API (ללא עוגיות, קרדיט $5 חינם בחודש, מחזיר קובץ מלא לחיתוך מקומי של כל החלקים!)
+async function tryApifyEngine(videoId) {
+    if (!APIFY_TOKEN) throw new Error('SKIP: APIFY_TOKEN not configured');
+
+    const ytUrl = `https://www.youtube.com/watch?v=${videoId}`;
+    const apiUrl = `https://api.apify.com/v2/actors/${encodeURIComponent(APIFY_ACTOR)}/run-sync-get-dataset-items?token=${encodeURIComponent(APIFY_TOKEN)}`;
+
+    const res = await fetchWithTimeout(apiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            videoUrls: [ytUrl],
+            format: 'audio',
+            audioFormat: 'm4a',
+            quality: 'standard'
+        })
+    }, 65000);
+
+    if (!res.ok) {
+        if ([401, 402, 403, 429].includes(res.status)) {
+            setEngineCooldown('apify', `HTTP_${res.status}`);
+        }
+        throw new Error(`APIFY HTTP_${res.status}`);
+    }
+
+    const items = await res.json();
+    const row = Array.isArray(items) ? items[0] : items;
+    if (!row || typeof row !== 'object') throw new Error('APIFY empty dataset');
+
+    const audioUrl = row.fileUrl || row.downloadUrl || row.audioUrl || row.url || row.link;
+    if (!audioUrl || !String(audioUrl).startsWith('http') || String(audioUrl).includes('youtube.com/watch')) {
+        throw new Error(`APIFY no fileUrl (${row.error || row.status || 'unknown'})`);
+    }
+
+    const dlRes = await fetchWithTimeout(audioUrl, {}, 60000);
+    if (!dlRes.ok) throw new Error(`APIFY_DL HTTP_${dlRes.status}`);
+    const buf = Buffer.from(await dlRes.arrayBuffer());
+    if (buf.length < 8000 || isHtmlBuffer(buf)) {
+        throw new Error(`APIFY invalid audio (${buf.length} bytes)`);
+    }
+
+    // מחזיר alreadyTrimmed=false כדי שהשרת יוכל לחתוך את כל החלקים 1..12 מקומית מאותה הורדה יחידה!
+    return { buffer: buf, alreadyTrimmed: false, detail: `${APIFY_ACTOR} (${Math.round(buf.length / 1024)}KB)` };
 }
 
 function extractAudioUrlFromRapidPayload(payload, depth = 0) {
@@ -640,7 +693,6 @@ function getRapidCandidateTemplates(cfg) {
     const h = cfg.host.toLowerCase();
     let list = [];
     if (h.includes('youtube-info-download-api')) {
-        // קודם MP3 64kbps (ישיר ללא FFmpeg), ואם נתקע ב-Initialising עובר ל-m4a (ללא המרה בשרת המרוחק)
         list = [
             '/ajax/download.php?url={url}&format=mp3&audio_quality=64',
             '/ajax/download.php?url={url}&format=m4a'
@@ -673,7 +725,7 @@ function renderRapidTemplate(tpl, host, videoId, startSec, durationSec) {
     return { url: `https://${host}${ep}`, supportsTrim: ep.includes('end_time=') };
 }
 
-async function tryRapidApiEngine(cfg, videoId, startSec, durationSec) {
+async function tryRapidApiEngine(cfg, videoId, startSec, durationSec, isBackground = false) {
     if (!cfg.key || !cfg.host) throw new Error(`SKIP: ${cfg.id} not configured`);
 
     const headers = { 'x-rapidapi-key': cfg.key, 'x-rapidapi-host': cfg.host };
@@ -684,7 +736,7 @@ async function tryRapidApiEngine(cfg, videoId, startSec, durationSec) {
     for (const tpl of templates) {
         const { url: endpointUrl, supportsTrim } = renderRapidTemplate(tpl, cfg.host, videoId, startSec, durationSec);
         try {
-            const res = await fetchWithTimeout(endpointUrl, { headers }, 22000);
+            const res = await fetchWithTimeout(endpointUrl, { headers }, 25000);
             if (res.status === 404) {
                 lastErr = new Error(`${cfg.id}: HTTP_404 on ${tpl}`);
                 continue;
@@ -700,16 +752,12 @@ async function tryRapidApiEngine(cfg, videoId, startSec, durationSec) {
             const json = await res.json();
             let resolvedUrl = extractAudioUrlFromRapidPayload(json);
 
-            // דגימה תקינה לפי התיעוד הרשמי: כל 1.2 שניות (אפס rate-limit, אפס מכסה על progress_url)
             if (!resolvedUrl && (json.progress_url || json.id || String(json.status || '').toLowerCase() === 'processing')) {
                 const jobUrl = json.progress_url || (json.id ? `https://${cfg.host}/api/progress?id=${encodeURIComponent(json.id)}` : endpointUrl);
                 const isRapidHostJob = jobUrl.includes(cfg.host);
-                const pollIntervalMs = 1200;
-                const maxAttempts = 50; // עד 60 שניות אם ההתקדמות זזה
-                let lastProgressNum = -1;
+                const pollIntervalMs = 1500;
+                const maxAttempts = isBackground ? 65 : 42;
                 let lastProgressStr = '';
-                let stalledAtInitSince = Date.now();
-                let stalledInit = false;
 
                 for (let i = 0; i < maxAttempts; i++) {
                     await new Promise(r => setTimeout(r, pollIntervalMs));
@@ -718,7 +766,6 @@ async function tryRapidApiEngine(cfg, videoId, startSec, durationSec) {
                     if (!pRes.ok) continue;
                     const pJson = await pRes.json();
 
-                    const pNum = Number(pJson.progress);
                     const pTxt = String(pJson.text || pJson.status || '');
                     lastProgressStr = `${pJson.progress ?? ''}/${pTxt}`;
 
@@ -729,25 +776,12 @@ async function tryRapidApiEngine(cfg, videoId, startSec, durationSec) {
                     if (st === 'failed' || st === 'error' || st === 'fail' || st === 'expired') {
                         throw new Error(`${cfg.id}_JOB_FAILED: ${pJson.msg || pJson.message || st}`);
                     }
-
-                    // זיהוי תקיעה ב-Initialising (כמו progress=21 שלא זז 22 שניות) -> עובר מיד לניסיון m4a
-                    if (!isNaN(pNum) && pNum > lastProgressNum) {
-                        lastProgressNum = pNum;
-                        stalledAtInitSince = Date.now();
-                    } else if ((isNaN(pNum) || pNum < 100) && (Date.now() - stalledAtInitSince) > 22000) {
-                        stalledInit = true;
-                        break;
-                    }
                 }
 
                 if (!resolvedUrl) {
-                    const reason = stalledInit
-                        ? `${cfg.id}: Stalled at ${lastProgressStr} for 22s (${tpl})`
-                        : `${cfg.id}: Conversion timeout after 60s (progress=${lastProgressStr})`;
-                    lastErr = new Error(reason);
-                    // אם נתקע ב-mp3 ויש נתיב m4a בתור — מנסים m4a!
-                    if (stalledInit && tpl.includes('format=mp3')) {
-                        console.warn(`[RapidAPI] ${reason} -> retrying with m4a...`);
+                    lastErr = new Error(`${cfg.id}: Conversion timeout (last=${lastProgressStr})`);
+                    if (tpl.includes('format=mp3')) {
+                        console.warn(`[RapidAPI] ${lastErr.message} -> retrying with m4a...`);
                         continue;
                     }
                     throw lastErr;
@@ -759,7 +793,7 @@ async function tryRapidApiEngine(cfg, videoId, startSec, durationSec) {
                 continue;
             }
 
-            const dlRes = await fetchWithTimeout(resolvedUrl, {}, 45000);
+            const dlRes = await fetchWithTimeout(resolvedUrl, {}, 60000);
             if (!dlRes.ok) throw new Error(`${cfg.id}_DL: HTTP_${dlRes.status}`);
             const buf = Buffer.from(await dlRes.arrayBuffer());
             if (buf.length < 8000 || isHtmlBuffer(buf)) {
@@ -770,7 +804,7 @@ async function tryRapidApiEngine(cfg, videoId, startSec, durationSec) {
             return { buffer: buf, alreadyTrimmed: supportsTrim, detail: tpl };
         } catch (err) {
             lastErr = err;
-            if (!String(err.message).includes('HTTP_404') && !String(err.message).includes('Stalled at')) {
+            if (!String(err.message).includes('HTTP_404') && !String(err.message).includes('Conversion timeout')) {
                 all404 = false;
                 break;
             }
@@ -802,7 +836,7 @@ async function tryCobaltEngine(videoId) {
     const json = await res.json();
     const audioUrl = json.url || (Array.isArray(json.picker) && json.picker[0]?.url);
     if (!audioUrl) throw new Error('COBALT no url');
-    const dlRes = await fetchWithTimeout(audioUrl, {}, 35000);
+    const dlRes = await fetchWithTimeout(audioUrl, {}, 45000);
     if (!dlRes.ok) throw new Error(`COBALT_DL HTTP_${dlRes.status}`);
     const buf = Buffer.from(await dlRes.arrayBuffer());
     if (buf.length < 8000 || isHtmlBuffer(buf)) throw new Error('COBALT invalid audio');
@@ -830,7 +864,7 @@ async function tryInvidiousParallel(videoId) {
 
         for (const tryUrl of [proxiedUrl, streamUrl]) {
             try {
-                const dlRes = await fetchWithTimeout(tryUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 18000);
+                const dlRes = await fetchWithTimeout(tryUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 20000);
                 if (!dlRes.ok) continue;
                 const buf = Buffer.from(await dlRes.arrayBuffer());
                 if (buf.length > 8000 && !isHtmlBuffer(buf)) {
@@ -861,7 +895,7 @@ async function tryPipedParallel(videoId) {
         if (audioStreams.length === 0) throw new Error(`${base}: no audioStreams`);
 
         audioStreams.sort((a, b) => (a.bitrate || 999999) - (b.bitrate || 999999));
-        const dlRes = await fetchWithTimeout(audioStreams[0].url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 18000);
+        const dlRes = await fetchWithTimeout(audioStreams[0].url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, 20000);
         if (!dlRes.ok) throw new Error(`${base}_DL: HTTP_${dlRes.status}`);
         const buf = Buffer.from(await dlRes.arrayBuffer());
         if (buf.length > 8000 && !isHtmlBuffer(buf)) {
@@ -880,15 +914,18 @@ async function tryPipedParallel(videoId) {
 async function tryInnerTubeDirect(videoId) {
     const clients = [
         {
-            name: 'ANDROID_VR',
-            ua: 'com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
-            context: { client: { clientName: 'ANDROID_VR', clientVersion: '1.60.19', deviceMake: 'Oculus', deviceModel: 'Quest 3', androidSdkVersion: 32, hl: 'en', gl: 'US' } }
-        },
-        {
             name: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
             ua: 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.0) AppleWebKit/537.36',
             context: {
                 client: { clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER', clientVersion: '2.0', hl: 'en', gl: 'US' },
+                thirdParty: { embedUrl: 'https://www.youtube.com/' }
+            }
+        },
+        {
+            name: 'WEB_EMBEDDED_PLAYER',
+            ua: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            context: {
+                client: { clientName: 'WEB_EMBEDDED_PLAYER', clientVersion: '1.20261001.01.00', hl: 'en', gl: 'US' },
                 thirdParty: { embedUrl: 'https://www.youtube.com/' }
             }
         }
@@ -912,7 +949,7 @@ async function tryInnerTubeDirect(videoId) {
                 .filter(f => f && f.url && String(f.mimeType || '').includes('audio/'));
             if (formats.length === 0) { lastErr = new Error(`${c.name}: no direct url`); continue; }
             formats.sort((a, b) => (a.bitrate || 999999) - (b.bitrate || 999999));
-            const dlRes = await fetchWithTimeout(formats[0].url, { headers: { 'User-Agent': c.ua } }, 18000);
+            const dlRes = await fetchWithTimeout(formats[0].url, { headers: { 'User-Agent': c.ua } }, 20000);
             if (!dlRes.ok) { lastErr = new Error(`${c.name}_DL: HTTP_${dlRes.status}`); continue; }
             const buf = Buffer.from(await dlRes.arrayBuffer());
             if (buf.length > 8000 && !isHtmlBuffer(buf)) return { buffer: buf, alreadyTrimmed: false, detail: c.name };
@@ -921,7 +958,7 @@ async function tryInnerTubeDirect(videoId) {
     throw lastErr || new Error('InnerTube failed');
 }
 
-// ==================== yt-dlp 2026 (עם EJS + Node path + שגיאות מלאות) ====================
+// ==================== yt-dlp אוקטובר 2026 (לקוחות tv_samsung, visionos, web_embedded + פרוקסי ללא עוגיות) ====================
 async function ensureYtDlpBinary(forceRefresh = false) {
     if (!forceRefresh && fs.existsSync(YTDLP_BIN_PATH)) {
         const stat = fs.statSync(YTDLP_BIN_PATH);
@@ -955,9 +992,9 @@ function extractRealYtDlpError(stderr, err) {
     return String(err?.message || 'yt-dlp failed').slice(0, 220);
 }
 
-function runYtDlpOnce(binPath, videoId, startSec, durationSec, opts = {}) {
+function runYtDlpFullAudio(binPath, videoId, opts = {}) {
     return new Promise((resolve, reject) => {
-        const prefix = `yt_${videoId}_${startSec}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        const prefix = `ytfull_${videoId}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
         const tmpl = path.join(os.tmpdir(), `${prefix}.%(ext)s`);
         const args = [
             '--no-playlist',
@@ -965,12 +1002,11 @@ function runYtDlpOnce(binPath, videoId, startSec, durationSec, opts = {}) {
             '--cache-dir', YTDLP_CACHE_DIR,
             '--force-ipv4',
             '--socket-timeout', '15',
-            '--retries', '2',
-            '-f', 'worstaudio[abr>=32]/bestaudio[abr<=96]/bestaudio[ext=m4a]/bestaudio/worst',
-            '--ffmpeg-location', ffmpegPath
+            '--retries', '3',
+            '-S', 'proto:https,+abr',
+            '-f', 'worstaudio[protocol^=http][abr>=32]/bestaudio[protocol^=http][abr<=96]/bestaudio[protocol^=http]/worstaudio[abr>=32]/bestaudio/worst'
         ];
 
-        // חובה ב-yt-dlp 2026: מפעיל את Node המדויק של השרת + סקריפט EJS מ-GitHub (נשמר במטמון)
         if (!opts.skipEjs) {
             args.push('--js-runtimes', `node:${process.execPath}`);
             args.push('--remote-components', 'ejs:github');
@@ -978,16 +1014,16 @@ function runYtDlpOnce(binPath, videoId, startSec, durationSec, opts = {}) {
         if (opts.playerClients) args.push('--extractor-args', `youtube:player_client=${opts.playerClients}`);
         if (opts.proxyUrl) args.push('--proxy', opts.proxyUrl);
         if (opts.cookiesPath) args.push('--cookies', opts.cookiesPath);
-        if (durationSec > 0) args.push('--download-sections', `*${startSec}-${startSec + durationSec}`);
         args.push('-o', tmpl, `https://www.youtube.com/watch?v=${videoId}`);
 
-        const execTimeout = durationSec > 0 ? 48000 : 35000;
-        execFile(binPath, args, { timeout: execTimeout, maxBuffer: 6 * 1024 * 1024 }, (err, stdout, stderr) => {
+        execFile(binPath, args, { timeout: 60000, maxBuffer: 6 * 1024 * 1024 }, (err, stdout, stderr) => {
             const files = fs.readdirSync(os.tmpdir()).filter(f => f.startsWith(prefix + '.') && !f.endsWith('.part'));
             if (files.length > 0) {
                 const fullPath = path.join(os.tmpdir(), files[0]);
-                if (fs.statSync(fullPath).size > 5000) {
-                    return resolve({ filePath: fullPath, alreadyTrimmed: durationSec > 0, detail: opts.playerClients || 'default+ejs' });
+                const sz = fs.statSync(fullPath).size;
+                if (sz > 5000) {
+                    console.log(`[yt-dlp Full Audio OK] file=${files[0]} bytes=${sz}`);
+                    return resolve({ filePath: fullPath, alreadyTrimmed: false, isFullLocalFile: true, detail: `${opts.playerClients || 'default-2026'} (${Math.round(sz / 1024)}KB)` });
                 }
                 fs.promises.unlink(fullPath).catch(() => null);
             }
@@ -996,38 +1032,42 @@ function runYtDlpOnce(binPath, videoId, startSec, durationSec, opts = {}) {
     });
 }
 
-async function tryYtDlpMode(mode, videoId, startSec, durationSec) {
+async function tryYtDlpMode(mode, videoId) {
     const binPath = await ensureYtDlpBinary(false);
     const cookiesPath = getCookiesFilePath();
     const attempts = [];
 
-    if (mode === 'ytdlp_cookies') {
-        if (!cookiesPath && !PROXY_URL) throw new Error('SKIP: YT_COOKIES_B64 / PROXY_URL not set');
-        // ברירת המחדל הרשמית של yt-dlp 2026 עם עוגיות + EJS, ואחריה tv/mweb
-        attempts.push({ cookiesPath: cookiesPath || undefined, proxyUrl: PROXY_URL || undefined });
-        attempts.push({ cookiesPath: cookiesPath || undefined, proxyUrl: PROXY_URL || undefined, playerClients: 'tv,mweb,web' });
+    if (mode === 'ytdlp_proxy_nocookies') {
+        // הורדה ללא עוגיות דרך פרוקסי ביתי/ISP עם לקוחות אוקטובר 2026
+        if (!PROXY_URL) throw new Error('SKIP: PROXY_URL not set');
+        attempts.push({ proxyUrl: PROXY_URL, playerClients: 'tv_samsung,visionos,web_embedded' });
+        attempts.push({ proxyUrl: PROXY_URL });
+    } else if (mode === 'ytdlp_cookies') {
+        if (!cookiesPath) throw new Error('SKIP: YT_COOKIES_B64 not set');
+        attempts.push({ cookiesPath, proxyUrl: PROXY_URL || undefined, playerClients: 'tv_samsung,web_embedded,web' });
+        attempts.push({ cookiesPath, proxyUrl: PROXY_URL || undefined });
     } else if (mode === 'ytdlp_direct') {
-        attempts.push({ playerClients: 'android_vr,tv_simply' });
-        attempts.push({});
+        // הורדה ישירה ללא עוגיות עם לקוחות אוקטובר 2026 המעודכנים (ללא android_vr שנשבר)
+        attempts.push({ playerClients: 'tv_samsung,visionos,web_embedded' });
+        attempts.push({ playerClients: 'web_embedded,mweb' });
     }
 
     let lastErr = null;
     for (const cfg of attempts) {
         try {
-            return await runYtDlpOnce(binPath, videoId, startSec, durationSec, cfg);
+            return await runYtDlpFullAudio(binPath, videoId, cfg);
         } catch (err) {
             lastErr = err;
             const msg = String(err.message || '');
             if (msg.includes('no such option')) {
                 try {
-                    return await runYtDlpOnce(binPath, videoId, startSec, durationSec, { ...cfg, skipEjs: true });
+                    return await runYtDlpFullAudio(binPath, videoId, { ...cfg, skipEjs: true });
                 } catch (e2) { lastErr = e2; }
             }
         }
     }
     if (lastErr) {
         const low = String(lastErr.message).toLowerCase();
-        // משהה רק על חסימה קשיחה אמיתית — לא על Timeout חד-פעמי!
         if (low.includes('not a bot') || low.includes('sign in') || low.includes('http error 403')) {
             setEngineCooldown(mode, lastErr.message);
         }
@@ -1035,7 +1075,6 @@ async function tryYtDlpMode(mode, videoId, startSec, durationSec) {
     throw lastErr || new Error(`${mode} failed`);
 }
 
-// חימום מוקדם של EJS Solver בעליית השרת (חוסך זמן בשיחה הראשונה)
 async function prewarmYtDlpEjs() {
     try {
         const binPath = await ensureYtDlpBinary(false);
@@ -1055,48 +1094,41 @@ async function prewarmYtDlpEjs() {
     } catch (e) {}
 }
 
-// מעבר ישיר ללא קידוד מחדש לכל MP3 מוכן עד 10MB, וקידוד מהיר 32k מונו כשצריך
-async function finalizeToCompactMp3(rawResult, videoId, startSec, durationSec) {
-    const { buffer, filePath, alreadyTrimmed } = rawResult;
-
-    if (buffer && isValidMp3Header(buffer) && buffer.length < DIRECT_MP3_MAX_BYTES && (alreadyTrimmed || (startSec === 0 && durationSec === 0))) {
-        return buffer;
-    }
-
-    const tmpIn = filePath || path.join(os.tmpdir(), `in_${videoId}_${startSec}_${Date.now()}.bin`);
-    const tmpOut = path.join(os.tmpdir(), `out_${videoId}_${startSec}_${Date.now()}.mp3`);
+// חיתוך וקידוד מקומי מקובץ בדיסק (24kbps מונו — ~2.6MB ל-15 דקות, חסכוני ל-5GB של Render)
+async function sliceLocalAudioToCompactMp3(inputPath, startSec = 0, durationSec = 0, alreadyTrimmed = false) {
+    const tmpOut = path.join(os.tmpdir(), `slice_${startSec}_${Date.now()}_${Math.random().toString(36).slice(2, 5)}.mp3`);
     try {
-        if (!filePath && buffer) await fs.promises.writeFile(tmpIn, buffer);
-
         let copySucceeded = false;
-        try {
-            await new Promise((resolve, reject) => {
-                const ffTimer = setTimeout(() => reject(new Error('FFmpeg copy timeout')), 12000);
-                let cmd = ffmpeg(tmpIn);
-                if (!alreadyTrimmed && startSec > 0) cmd = cmd.setStartTime(startSec);
-                if (!alreadyTrimmed && durationSec > 0) cmd = cmd.duration(durationSec);
-                cmd.format('mp3').audioCodec('copy')
-                    .on('end', () => { clearTimeout(ffTimer); resolve(); })
-                    .on('error', err => { clearTimeout(ffTimer); reject(err); })
-                    .save(tmpOut);
-            });
-            const copiedBuf = await fs.promises.readFile(tmpOut);
-            if (copiedBuf.length > 5000 && copiedBuf.length < DIRECT_MP3_MAX_BYTES) {
-                copySucceeded = true;
-                return copiedBuf;
-            }
-        } catch (copyErr) {}
+        if (inputPath.toLowerCase().endsWith('.mp3') || inputPath.toLowerCase().endsWith('.bin')) {
+            try {
+                await new Promise((resolve, reject) => {
+                    const ffTimer = setTimeout(() => reject(new Error('FFmpeg copy timeout')), 12000);
+                    let cmd = ffmpeg(inputPath);
+                    if (!alreadyTrimmed && startSec > 0) cmd = cmd.setStartTime(startSec);
+                    if (!alreadyTrimmed && durationSec > 0) cmd = cmd.duration(durationSec);
+                    cmd.format('mp3').audioCodec('copy')
+                        .on('end', () => { clearTimeout(ffTimer); resolve(); })
+                        .on('error', err => { clearTimeout(ffTimer); reject(err); })
+                        .save(tmpOut);
+                });
+                const copiedBuf = await fs.promises.readFile(tmpOut);
+                if (copiedBuf.length > 4000 && copiedBuf.length <= DIRECT_MP3_MAX_BYTES) {
+                    copySucceeded = true;
+                    return copiedBuf;
+                }
+            } catch (copyErr) {}
+        }
 
         if (!copySucceeded) {
             await fs.promises.unlink(tmpOut).catch(() => null);
             await new Promise((resolve, reject) => {
-                const ffTimer = setTimeout(() => reject(new Error('FFmpeg encode timeout')), 55000);
-                let cmd = ffmpeg(tmpIn);
+                const ffTimer = setTimeout(() => reject(new Error('FFmpeg encode timeout')), 65000);
+                let cmd = ffmpeg(inputPath);
                 if (!alreadyTrimmed && startSec > 0) cmd = cmd.setStartTime(startSec);
                 if (!alreadyTrimmed && durationSec > 0) cmd = cmd.duration(durationSec);
                 cmd.format('mp3')
                     .audioCodec('libmp3lame')
-                    .audioBitrate('32k')
+                    .audioBitrate('24k')
                     .audioChannels(1)
                     .audioFrequency(16000)
                     .outputOptions(['-compression_level 9', '-threads 0'])
@@ -1105,19 +1137,44 @@ async function finalizeToCompactMp3(rawResult, videoId, startSec, durationSec) {
                     .save(tmpOut);
             });
             const encBuf = await fs.promises.readFile(tmpOut);
-            if (encBuf.length < 2000) throw new Error('Encoded MP3 empty');
+            if (encBuf.length < 1500) throw new Error('EMPTY_SLICE');
             return encBuf;
         }
     } finally {
-        fs.promises.unlink(tmpIn).catch(() => null);
         fs.promises.unlink(tmpOut).catch(() => null);
     }
 }
 
-async function runSingleEngine(engine, videoId, startSec, durationSec) {
-    if (engine === 'rapidapi1') return await tryRapidApiEngine(RAPID_CONFIGS[0], videoId, startSec, durationSec);
-    if (engine === 'rapidapi2') return await tryRapidApiEngine(RAPID_CONFIGS[1], videoId, startSec, durationSec);
-    if (engine === 'ytdlp_cookies' || engine === 'ytdlp_direct') return await tryYtDlpMode(engine, videoId, startSec, durationSec);
+async function finalizeRawToMp3(rawResult, videoId, startSec, durationSec, keepLocalFile = false) {
+    const { buffer, filePath, alreadyTrimmed } = rawResult;
+
+    if (!keepLocalFile && buffer && isValidMp3Header(buffer) && buffer.length <= DIRECT_MP3_MAX_BYTES && (alreadyTrimmed || (startSec === 0 && durationSec === 0))) {
+        return { mp3Buf: buffer, reusableFilePath: null };
+    }
+
+    const localPath = filePath || path.join(os.tmpdir(), `in_${videoId}_${startSec}_${Date.now()}.bin`);
+    if (!filePath && buffer) {
+        await fs.promises.writeFile(localPath, buffer);
+    }
+
+    try {
+        const mp3Buf = await sliceLocalAudioToCompactMp3(localPath, startSec, durationSec, alreadyTrimmed);
+        if (keepLocalFile && !alreadyTrimmed) {
+            return { mp3Buf, reusableFilePath: localPath };
+        }
+        fs.promises.unlink(localPath).catch(() => null);
+        return { mp3Buf, reusableFilePath: null };
+    } catch (err) {
+        fs.promises.unlink(localPath).catch(() => null);
+        throw err;
+    }
+}
+
+async function runSingleEngine(engine, videoId, startSec, durationSec, isBackground = false) {
+    if (engine === 'apify') return await tryApifyEngine(videoId);
+    if (engine === 'ytdlp_proxy_nocookies' || engine === 'ytdlp_cookies' || engine === 'ytdlp_direct') return await tryYtDlpMode(engine, videoId);
+    if (engine === 'rapidapi1') return await tryRapidApiEngine(RAPID_CONFIGS[0], videoId, startSec, durationSec, isBackground);
+    if (engine === 'rapidapi2') return await tryRapidApiEngine(RAPID_CONFIGS[1], videoId, startSec, durationSec, isBackground);
     if (engine === 'cobalt') return await tryCobaltEngine(videoId);
     if (engine === 'invidious_parallel') return await tryInvidiousParallel(videoId);
     if (engine === 'piped_parallel') return await tryPipedParallel(videoId);
@@ -1125,7 +1182,7 @@ async function runSingleEngine(engine, videoId, startSec, durationSec) {
     throw new Error(`Unknown engine: ${engine}`);
 }
 
-async function downloadSegmentBufferHybrid(videoId, startSec = 0, durationSec = 900) {
+async function downloadSegmentOrFull(videoId, startSec = 0, durationSec = CHUNK_SEC, keepLocalFile = false, isBackground = false) {
     const errors = [];
     const order = getDynamicEngineOrder();
     for (const engine of order) {
@@ -1135,11 +1192,11 @@ async function downloadSegmentBufferHybrid(videoId, startSec = 0, durationSec = 
         }
         try {
             const t0 = Date.now();
-            const rawRes = await runSingleEngine(engine, videoId, startSec, durationSec);
-            const mp3Buf = await finalizeToCompactMp3(rawRes, videoId, startSec, durationSec);
+            const rawRes = await runSingleEngine(engine, videoId, startSec, durationSec, isBackground);
+            const { mp3Buf, reusableFilePath } = await finalizeRawToMp3(rawRes, videoId, startSec, durationSec, keepLocalFile);
             lastWinningEngine = engine;
-            console.log(`[Download OK] engine=${engine} (${rawRes.detail || 'ok'}) video=${videoId} seg=${startSec}-${startSec + durationSec} bytes=${mp3Buf.length} ms=${Date.now() - t0}`);
-            return mp3Buf;
+            console.log(`[Download OK] engine=${engine} (${rawRes.detail || 'ok'}) video=${videoId} seg=${startSec}-${startSec + durationSec} bytes=${mp3Buf.length} reusable=${Boolean(reusableFilePath)} ms=${Date.now() - t0}`);
+            return { mp3Buf, reusableFilePath };
         } catch (err) {
             const msg = err.message || String(err);
             if (!msg.startsWith('SKIP:')) console.warn(`[Engine Fail] ${engine}:`, msg);
@@ -1149,8 +1206,7 @@ async function downloadSegmentBufferHybrid(videoId, startSec = 0, durationSec = 
     throw new Error(`ALL_ENGINES_FAILED -> ${errors.join(' ; ')}`);
 }
 
-async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFolder, durationSeconds = 0) {
-    const cleanLive = String(livePlayFolder).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
+async function downloadAndPreparePlayback(videoId, archiveUserFolder, durationSeconds = 0) {
     const cleanArchive = String(archiveUserFolder).replace(/^ivr2:\/*/, '').replace(/^\/*/, '').replace(/\/*$/, '');
 
     const cacheKey = `${cleanArchive}:${videoId}`;
@@ -1160,42 +1216,78 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
         return cached.playCmd;
     }
 
-    const isLongVideo = durationSeconds > 900;
-    const firstChunkSec = isLongVideo ? 900 : 0;
+    const isLongVideo = durationSeconds > CHUNK_SEC;
+    const totalParts = isLongVideo
+        ? Math.min(MAX_PARTS, Math.max(2, Math.ceil((durationSeconds - 10) / CHUNK_SEC)))
+        : 1;
 
-    const [firstMp3Buf, , archNum] = await Promise.all([
-        downloadSegmentBufferHybrid(videoId, 0, firstChunkSec),
+    const [firstResult, , rawPartNums] = await Promise.all([
+        downloadSegmentOrFull(videoId, 0, isLongVideo ? CHUNK_SEC : 0, isLongVideo, false),
         ensurePlayfileExtension(cleanArchive),
-        getNextFileNumberStr(cleanArchive, 1)
+        getNextFileNumberStr(cleanArchive, totalParts)
     ]);
 
-    const archPath = `ivr2:/${cleanArchive}/${archNum}.mp3`;
-    await uploadAudioBufferToExactPath(firstMp3Buf, archPath, `${archNum}.mp3`, '1', 35000);
+    const partNums = Array.isArray(rawPartNums) ? rawPartNums : [rawPartNums];
+    const firstPath = `ivr2:/${cleanArchive}/${partNums[0]}.mp3`;
+    await uploadAudioBufferToExactPath(firstResult.mp3Buf, firstPath, `${partNums[0]}.mp3`, '1', 40000);
 
-    if (!isLongVideo) {
-        const playCmd = `f-/${cleanArchive}/${archNum}`;
-        recentPlaybackCache.set(cacheKey, { playCmd, ts: Date.now() });
-        return playCmd;
-    }
-
-    const TOTAL_PARTS = Math.min(8, Math.max(2, Math.ceil((durationSeconds - 10) / 900)));
-    const rawPartNums = await getNextFileNumberStr(cleanLive, TOTAL_PARTS - 1);
-    const extraNums = Array.isArray(rawPartNums) ? rawPartNums : [rawPartNums];
-    const chainedPlayCommand = [`f-/${cleanArchive}/${archNum}`, ...extraNums.map(n => `f-/${cleanLive}/${n}`)].join('.');
-
+    const chainedPlayCommand = partNums.map(n => `f-/${cleanArchive}/${n}`).join('.');
     recentPlaybackCache.set(cacheKey, { playCmd: chainedPlayCommand, ts: Date.now() });
 
+    if (!isLongVideo) {
+        if (firstResult.reusableFilePath) fs.promises.unlink(firstResult.reusableFilePath).catch(() => null);
+        return chainedPlayCommand;
+    }
+
     (async () => {
-        for (let i = 1; i < TOTAL_PARTS; i++) {
-            const startSec = i * 900;
-            try {
-                const partBuf = await downloadSegmentBufferHybrid(videoId, startSec, 900);
-                if (partBuf && partBuf.length > 5000) {
-                    const liveNum = extraNums[i - 1];
-                    await uploadAudioBufferToExactPath(partBuf, `ivr2:/${cleanLive}/${liveNum}.mp3`, `${liveNum}.mp3`, '1', 45000);
+        let localFullFile = firstResult.reusableFilePath;
+        try {
+            for (let i = 1; i < totalParts; i++) {
+                const startSec = i * CHUNK_SEC;
+                const targetNum = partNums[i];
+                const targetPath = `ivr2:/${cleanArchive}/${targetNum}.mp3`;
+                let partBuf = null;
+
+                if (localFullFile && fs.existsSync(localFullFile)) {
+                    try {
+                        const t0 = Date.now();
+                        partBuf = await sliceLocalAudioToCompactMp3(localFullFile, startSec, CHUNK_SEC, false);
+                        console.log(`[Local Split OK] Part ${i + 1}/${totalParts} (${startSec}-${startSec + CHUNK_SEC}s) bytes=${partBuf.length} ms=${Date.now() - t0}`);
+                    } catch (sliceErr) {
+                        if (String(sliceErr.message).includes('EMPTY_SLICE')) {
+                            console.log(`[Local Split] Reached end of audio at Part ${i + 1}`);
+                            break;
+                        }
+                        console.warn(`[Local Split Part ${i + 1} Error]`, sliceErr.message);
+                    }
                 }
-            } catch (e) {
-                console.warn(`[Part ${i + 1} Error]`, e.message);
+
+                if (!partBuf) {
+                    for (let retry = 0; retry < 2 && !partBuf; retry++) {
+                        try {
+                            if (retry > 0) await new Promise(r => setTimeout(r, 4000));
+                            const resPart = await downloadSegmentOrFull(videoId, startSec, CHUNK_SEC, true, true);
+                            partBuf = resPart.mp3Buf;
+                            if (resPart.reusableFilePath && !localFullFile) {
+                                localFullFile = resPart.reusableFilePath;
+                            }
+                        } catch (e) {
+                            console.warn(`[Part ${i + 1}/${totalParts} Attempt ${retry + 1} Error]`, e.message);
+                        }
+                    }
+                }
+
+                if (partBuf && partBuf.length > 3000) {
+                    await uploadAudioBufferToExactPath(partBuf, targetPath, `${targetNum}.mp3`, '1', 50000);
+                    console.log(`[Part ${i + 1}/${totalParts} Uploaded] -> ${targetPath}`);
+                } else {
+                    console.error(`[Part ${i + 1}/${totalParts} Failed permanently]`);
+                }
+            }
+        } finally {
+            if (localFullFile) {
+                fs.promises.unlink(localFullFile).catch(() => null);
+                console.log('[Cleanup] Removed temporary full audio file');
             }
         }
     })();
@@ -1210,7 +1302,7 @@ function setCors(res) {
 }
 
 app.get('/', (req, res) => {
-    res.send('YouTube Personal Line Server v4.5 (yt-dlp EJS 2026 + Smart RapidAPI Stall Recovery) OK');
+    res.send('YouTube Personal Line Server v4.7 (Cookie-Less Apify + yt-dlp Oct 2026 + All Parts Local Split) OK');
 });
 
 app.get('/health', (req, res) => {
@@ -1221,18 +1313,20 @@ app.get('/health', (req, res) => {
         if (Date.now() < v.until) cooldowns[k] = { reason: v.reason, remainingSec: Math.round((v.until - Date.now()) / 1000) };
     }
     res.json({
-        version: '4.5.0',
-        nodePath: process.execPath,
+        version: '4.7.0',
+        maxParts: MAX_PARTS,
         activeEngineOrder: getDynamicEngineOrder(),
         lastWinningEngine,
         cookies: cookiesStatus,
         configured: {
-            rapidapi1: Boolean(RAPID_CONFIGS[0].key && RAPID_CONFIGS[0].host),
+            apify_nocookies: Boolean(APIFY_TOKEN),
+            apify_actor: APIFY_ACTOR,
+            proxy_nocookies: Boolean(PROXY_URL),
+            rapidapi1_nocookies: Boolean(RAPID_CONFIGS[0].key && RAPID_CONFIGS[0].host),
             rapidapi1_host: RAPID_CONFIGS[0].host || null,
-            rapidapi2: Boolean(RAPID_CONFIGS[1].key && RAPID_CONFIGS[1].host),
+            rapidapi2_nocookies: Boolean(RAPID_CONFIGS[1].key && RAPID_CONFIGS[1].host),
             ytdlp_cookies: Boolean(YT_COOKIES_B64),
             cobalt: Boolean(COBALT_API_URL),
-            proxy: Boolean(PROXY_URL),
             youtube_api_keys: YT_KEYS.length,
             gemini_key: Boolean(GEMINI_KEY),
             yemot_token: Boolean(TOKEN)
@@ -1245,15 +1339,28 @@ app.get('/test', async (req, res) => {
     setCors(res);
     if (req.query.reset === '1') engineCooldown.clear();
     const videoId = String(req.query.v || 'jNQXAC9IVRw').replace(/[^a-zA-Z0-9_-]/g, '');
-    const dur = parseInt(req.query.dur || '15', 10) || 15;
     const results = [];
 
     for (const engine of getDynamicEngineOrder()) {
         const t0 = Date.now();
+        let reusable = null;
         try {
-            const rawRes = await runSingleEngine(engine, videoId, 0, dur);
-            const mp3Buf = await finalizeToCompactMp3(rawRes, videoId, 0, dur);
-            results.push({ engine, status: 'OK', detail: rawRes.detail || '', bytes: mp3Buf.length, ms: Date.now() - t0 });
+            const rawRes = await runSingleEngine(engine, videoId, 0, 8, false);
+            const fin = await finalizeRawToMp3(rawRes, videoId, 0, 8, true);
+            reusable = fin.reusableFilePath;
+            let part2Bytes = 0;
+            if (reusable && fs.existsSync(reusable)) {
+                const p2 = await sliceLocalAudioToCompactMp3(reusable, 8, 8, false);
+                part2Bytes = p2.length;
+            }
+            results.push({
+                engine,
+                status: 'OK',
+                detail: rawRes.detail || '',
+                part1Bytes: fin.mp3Buf.length,
+                part2LocalSplitBytes: part2Bytes,
+                ms: Date.now() - t0
+            });
         } catch (err) {
             const msg = err.message || String(err);
             results.push({
@@ -1262,9 +1369,11 @@ app.get('/test', async (req, res) => {
                 error: msg,
                 ms: Date.now() - t0
             });
+        } finally {
+            if (reusable) fs.promises.unlink(reusable).catch(() => null);
         }
     }
-    res.json({ version: '4.5.0', cookies: cookiesStatus, videoId, results });
+    res.json({ version: '4.7.0', cookies: cookiesStatus, videoId, results });
 });
 
 // ==================== מנוע ימות המשיח ====================
@@ -1354,7 +1463,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 
             try {
                 const [playCmd, regName] = await Promise.all([
-                    downloadAndPreparePlayback(chosenVideo.videoId, tempRecFolder, archiveFolder, chosenVideo.durationSeconds || 0),
+                    downloadAndPreparePlayback(chosenVideo.videoId, archiveFolder, chosenVideo.durationSeconds || 0),
                     getUserNameIfRegistered(callerPhone).catch(() => null)
                 ]);
                 saveAdminLogToExt8(callerPhone, regName || 'משתמש רשום', categoryLabel, cleanQuery, chosenVideo.title, `הורד בהצלחה לשלוחה ${archiveFolder}`);
@@ -1512,7 +1621,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, '0.0.0.0', () => {
-    console.log(`=== Server v4.5 (yt-dlp EJS 2026 + Smart RapidAPI) Ready on port ${port} ===`);
+    console.log(`=== Server v4.7 (Cookie-Less Apify + yt-dlp Oct 2026 + Local Split) Ready on port ${port} ===`);
     getCookiesFilePath();
     console.log(`[Engine Order] ${getDynamicEngineOrder().join(' -> ')}`);
     prewarmYtDlpEjs().catch(() => null);
