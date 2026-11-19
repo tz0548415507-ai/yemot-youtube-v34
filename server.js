@@ -112,7 +112,7 @@ async function fetchWithTimeout(url, options = {}, timeout = 20000) {
     }
 }
 
-async function fetchYouTubeWithFallback(baseUrlWithoutKey, timeoutMs = 6500) {
+async function fetchYouTubeWithFallback(baseUrlWithoutKey, timeoutMs = 6000) {
     const keysToTry = YT_KEYS.length > 0 ? [
         YT_KEYS[activeYtKeyIndex % YT_KEYS.length],
         ...YT_KEYS.filter((_, idx) => idx !== (activeYtKeyIndex % YT_KEYS.length))
@@ -164,7 +164,7 @@ async function getUserNameIfRegistered(phone) {
     const folderPath = `ivr2:/users/${phone}`;
     try {
         const url = `${YM}GetIVR2Dir?token=${encodeURIComponent(TOKEN)}&path=${encodeURIComponent(folderPath)}`;
-        const res = await fetchWithTimeout(url, {}, 6000);
+        const res = await fetchWithTimeout(url, {}, 5000);
         if (res.ok) {
             const data = await res.json();
             const files = data.files || [];
@@ -176,7 +176,7 @@ async function getUserNameIfRegistered(phone) {
             if (hasNameFile) {
                 try {
                     const dlUrl = `${YM}DownloadFile?token=${encodeURIComponent(TOKEN)}&path=${encodeURIComponent(folderPath + '/name.txt')}`;
-                    const dlRes = await fetchWithTimeout(dlUrl, {}, 5000);
+                    const dlRes = await fetchWithTimeout(dlUrl, {}, 4000);
                     if (dlRes.ok) {
                         const nameTxt = (await dlRes.text()).trim();
                         if (nameTxt && !nameTxt.includes('responseStatus') && !nameTxt.includes('EXCEPTION')) {
@@ -203,12 +203,6 @@ async function ensurePlayfileExtension(folderPathStr) {
             path: `ivr2:/${clean}`,
             type: 'playfile'
         });
-        await fetchWithTimeout(`${YM}UpdateExtension`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body
-        }, 7000);
-
         const playfileIni = [
             'type=playfile',
             `playfile_end_goto=${YOUTUBE_MAIN_EXT}`,
@@ -217,7 +211,15 @@ async function ensurePlayfileExtension(folderPathStr) {
             `control_play_return=${YOUTUBE_MAIN_EXT}`,
             `control_play#=${YOUTUBE_MAIN_EXT}`
         ].join('\r\n') + '\r\n';
-        await uploadTextToExactPath(playfileIni, `ivr2:/${clean}/ext.ini`, 'ext.ini');
+
+        await Promise.all([
+            fetchWithTimeout(`${YM}UpdateExtension`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body
+            }, 6000),
+            uploadTextToExactPath(playfileIni, `ivr2:/${clean}/ext.ini`, 'ext.ini')
+        ]);
 
         configuredPlayfileDirs.add(clean);
     } catch (e) {}
@@ -241,7 +243,7 @@ async function getNextFileNumberStr(folder, reserveCount = 1) {
 
     try {
         const url = `${YM}GetIVR2Dir?token=${encodeURIComponent(TOKEN)}&path=${encodeURIComponent(folderPath)}`;
-        const res = await fetchWithTimeout(url, {}, 5000);
+        const res = await fetchWithTimeout(url, {}, 4500);
         if (res.ok) {
             const data = await res.json();
             const files = data.files || [];
@@ -292,8 +294,6 @@ async function saveAdminLogToExt8(callerPhone, userName, categoryLabel, searchQu
         const nowStr = new Date().toLocaleString('he-IL', { timeZone: 'Asia/Jerusalem' });
 
         const ttsSummary = `משתמש ${userName} טלפון ${callerPhone} חיפש ב${categoryLabel} את ${searchQuery}. סטטוס: ${statusText}`;
-        await uploadTextToExactPath(ttsSummary, `ivr2:/${ADMIN_LOG_EXT}/${nextNum}.tts`, `${nextNum}.tts`);
-
         const txtDetails = [
             `שם משתמש: ${userName}`,
             `מספר טלפון: ${callerPhone}`,
@@ -305,7 +305,10 @@ async function saveAdminLogToExt8(callerPhone, userName, categoryLabel, searchQu
             `זמן פעולה: ${nowStr}`
         ].join('\r\n') + '\r\n';
 
-        await uploadTextToExactPath(txtDetails, `ivr2:/${ADMIN_LOG_EXT}/${nextNum}.txt`, `${nextNum}.txt`);
+        await Promise.all([
+            uploadTextToExactPath(ttsSummary, `ivr2:/${ADMIN_LOG_EXT}/${nextNum}.tts`, `${nextNum}.tts`),
+            uploadTextToExactPath(txtDetails, `ivr2:/${ADMIN_LOG_EXT}/${nextNum}.txt`, `${nextNum}.txt`)
+        ]);
     } catch (err) {}
 }
 
@@ -330,7 +333,7 @@ async function downloadRecordingFromYemot(recordPath, apiDir) {
     for (const p of uniquePaths) {
         const url = `${YM}DownloadFile?token=${encodeURIComponent(TOKEN)}&path=${encodeURIComponent(p)}`;
         try {
-            const res = await fetchWithTimeout(url, {}, 10000);
+            const res = await fetchWithTimeout(url, {}, 8000);
             if (!res.ok) {
                 lastYemotResponse = `HTTP_${res.status}`;
                 continue;
@@ -361,7 +364,7 @@ async function getFastGeminiModels() {
         return [cachedModelName, ...defaultFastOrder.filter(m => m !== cachedModelName)];
     }
     try {
-        const res = await fetchWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_KEY}`, {}, 6000);
+        const res = await fetchWithTimeout(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_KEY}`, {}, 5000);
         if (res.ok) {
             const data = await res.json();
             const available = (data.models || [])
@@ -397,7 +400,7 @@ async function transcribeAudio(audioBase64) {
                     }],
                     generationConfig: { temperature: 0.1, maxOutputTokens: 60 }
                 })
-            }, 10000);
+            }, 9000);
 
             if (res.ok) {
                 cachedModelName = model;
@@ -438,6 +441,7 @@ function extractAudioUrlFromRapidPayload(payload) {
     return null;
 }
 
+// דגימת RapidAPI מואצת (כל 600ms במקום 1500ms) לזיהוי מיידי של הקובץ המוכן
 async function fetchRapidApiDownloadUrl(videoId, startSec = 0, endSec = 0) {
     if (!RAPIDAPI_KEY) throw new Error('RAPIDAPI_KEY is missing');
 
@@ -465,10 +469,10 @@ async function fetchRapidApiDownloadUrl(videoId, startSec = 0, endSec = 0) {
 
     let resolvedUrl = extractAudioUrlFromRapidPayload(json);
     if (!resolvedUrl && jobUrl) {
-        for (let attempt = 0; attempt < 20; attempt++) {
-            await new Promise(r => setTimeout(r, 1500));
+        for (let attempt = 0; attempt < 45; attempt++) {
+            await new Promise(r => setTimeout(r, 600));
             const pHeaders = jobUrl.includes(RAPIDAPI_HOST) ? headers : {};
-            const pRes = await fetchWithTimeout(jobUrl, { headers: pHeaders }, 12000);
+            const pRes = await fetchWithTimeout(jobUrl, { headers: pHeaders }, 10000);
             if (!pRes.ok) continue;
             const pJson = await pRes.json();
             resolvedUrl = pJson.download_url || extractAudioUrlFromRapidPayload(pJson);
@@ -503,30 +507,48 @@ async function ensureYtDlpBinary() {
     return ytdlpReadyPromise;
 }
 
-async function downloadSegmentToMp3Fast(videoId, outputMp3Path, startSec = 0, durationSec = 900) {
+function isValidMp3Header(buf) {
+    if (!buf || buf.length < 1024) return false;
+    // בדיקת תגית ID3 או פריים MP3 תקין (0xFF 0xE0..)
+    if (buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) return true;
+    if (buf[0] === 0xFF && (buf[1] & 0xE0) === 0xE0) return true;
+    return false;
+}
+
+// הורדה מואצת: מעתיקה ישירות MP3 מוכן ללא קידוד מחדש כשניתן, או מקודדת מהר ל-32kbps מונו חסכוני
+async function downloadSegmentBufferFast(videoId, startSec = 0, durationSec = 900) {
     let sourcePath = null;
+    let rawBuffer = null;
     const tmpRaw = path.join(os.tmpdir(), `raw_${videoId}_${startSec}_${Date.now()}.bin`);
+    const tmpOut = path.join(os.tmpdir(), `out_${videoId}_${startSec}_${Date.now()}.mp3`);
 
     try {
         if (RAPIDAPI_KEY) {
             const endSec = durationSec > 0 ? (startSec + durationSec) : 0;
             const rapidRes = await fetchRapidApiDownloadUrl(videoId, startSec, endSec);
             if (rapidRes.directBuffer && rapidRes.directBuffer.length > 20000) {
-                await fs.promises.writeFile(tmpRaw, rapidRes.directBuffer);
-                sourcePath = tmpRaw;
+                rawBuffer = rapidRes.directBuffer;
             } else if (rapidRes.streamUrl) {
                 const dlRes = await fetchWithTimeout(rapidRes.streamUrl, {}, 35000);
                 if (dlRes.ok) {
                     const buf = Buffer.from(await dlRes.arrayBuffer());
                     if (buf.length > 20000) {
-                        await fs.promises.writeFile(tmpRaw, buf);
-                        sourcePath = tmpRaw;
+                        rawBuffer = buf;
                     }
                 }
             }
         }
 
-        if (!sourcePath && !RAPIDAPI_KEY) {
+        // מסלול אולטרה-מהיר: אם זה שיר קצר שלם וכבר הגיע כ-MP3 תקין (עד 8MB), מחזירים מיד בלי לגעת ב-FFmpeg!
+        if (rawBuffer && durationSec === 0 && startSec === 0 && isValidMp3Header(rawBuffer) && rawBuffer.length < 8 * 1024 * 1024) {
+            return rawBuffer;
+        }
+
+        if (rawBuffer) {
+            await fs.promises.writeFile(tmpRaw, rawBuffer);
+            sourcePath = tmpRaw;
+            rawBuffer = null; // שחרור מיידי מהזיכרון
+        } else if (!RAPIDAPI_KEY) {
             const binPath = await ensureYtDlpBinary();
             const prefix = `yt_${videoId}_${startSec}_${Date.now()}`;
             const tmpl = path.join(os.tmpdir(), `${prefix}.%(ext)s`);
@@ -555,24 +577,43 @@ async function downloadSegmentToMp3Fast(videoId, outputMp3Path, startSec = 0, du
             throw new Error('RAPIDAPI_DOWNLOAD_EMPTY');
         }
 
-        await new Promise((resolve, reject) => {
-            const ffTimer = setTimeout(() => reject(new Error('FFmpeg timeout')), 45000);
-            let cmd = ffmpeg(sourcePath);
-            if (durationSec > 0) {
-                cmd = cmd.duration(durationSec);
+        // ניסיון חיתוך מהיר בהעתקת זרם (-c:a copy) אם הקובץ כבר MP3, ונפילה לקידוד 32kbps חסכוני אם לא
+        try {
+            await new Promise((resolve, reject) => {
+                const ffTimer = setTimeout(() => reject(new Error('FFmpeg copy timeout')), 15000);
+                let cmd = ffmpeg(sourcePath);
+                if (durationSec > 0) cmd = cmd.duration(durationSec);
+                cmd.format('mp3')
+                    .audioCodec('copy')
+                    .on('end', () => { clearTimeout(ffTimer); resolve(); })
+                    .on('error', (err) => { clearTimeout(ffTimer); reject(err); })
+                    .save(tmpOut);
+            });
+            const copiedBuf = await fs.promises.readFile(tmpOut);
+            if (copiedBuf.length > 5000 && copiedBuf.length < 8 * 1024 * 1024) {
+                return copiedBuf;
             }
-            cmd.format('mp3')
-                .audioCodec('libmp3lame')
-                .audioBitrate('32k')
-                .audioChannels(1)
-                .audioFrequency(16000)
-                .outputOptions(['-threads 0'])
-                .on('end', () => { clearTimeout(ffTimer); resolve(); })
-                .on('error', (err) => { clearTimeout(ffTimer); reject(err); })
-                .save(outputMp3Path);
-        });
+        } catch (copyErr) {
+            // קידוד חסכוני 32kbps מונו (למקרה שהמקור לא היה MP3 או חרג מהמשקל)
+            await new Promise((resolve, reject) => {
+                const ffTimer = setTimeout(() => reject(new Error('FFmpeg encode timeout')), 40000);
+                let cmd = ffmpeg(sourcePath);
+                if (durationSec > 0) cmd = cmd.duration(durationSec);
+                cmd.format('mp3')
+                    .audioCodec('libmp3lame')
+                    .audioBitrate('32k')
+                    .audioChannels(1)
+                    .audioFrequency(16000)
+                    .outputOptions(['-q:a 9', '-threads 0'])
+                    .on('end', () => { clearTimeout(ffTimer); resolve(); })
+                    .on('error', (err) => { clearTimeout(ffTimer); reject(err); })
+                    .save(tmpOut);
+            });
+            return await fs.promises.readFile(tmpOut);
+        }
     } finally {
         fs.promises.unlink(tmpRaw).catch(() => null);
+        fs.promises.unlink(tmpOut).catch(() => null);
         if (sourcePath && sourcePath !== tmpRaw) {
             fs.promises.unlink(sourcePath).catch(() => null);
         }
@@ -585,58 +626,48 @@ async function downloadAndPreparePlayback(videoId, livePlayFolder, archiveUserFo
 
     const isLongVideo = durationSeconds > 900;
     const firstChunkSec = isLongVideo ? 900 : 0;
-    const tmpFirstMp3 = path.join(os.tmpdir(), `first_${videoId}_${Date.now()}.mp3`);
 
-    try {
-        await downloadSegmentToMp3Fast(videoId, tmpFirstMp3, 0, firstChunkSec);
-        const firstMp3Buf = await fs.promises.readFile(tmpFirstMp3);
-        fs.promises.unlink(tmpFirstMp3).catch(() => null);
+    // הרצת הורדת השמע במקביל להכנת השלוחה והקצאת מספר הקובץ לחיסכון בזמן
+    const [firstMp3Buf, , archNum] = await Promise.all([
+        downloadSegmentBufferFast(videoId, 0, firstChunkSec),
+        ensurePlayfileExtension(cleanArchive),
+        getNextFileNumberStr(cleanArchive, 1)
+    ]);
 
-        await ensurePlayfileExtension(cleanArchive);
-        const archNum = await getNextFileNumberStr(cleanArchive, 1);
-        const archPath = `ivr2:/${cleanArchive}/${archNum}.mp3`;
-        await uploadAudioBufferToExactPath(firstMp3Buf, archPath, `${archNum}.mp3`, '1', 30000);
+    const archPath = `ivr2:/${cleanArchive}/${archNum}.mp3`;
+    await uploadAudioBufferToExactPath(firstMp3Buf, archPath, `${archNum}.mp3`, '1', 30000);
 
-        if (!isLongVideo) {
-            return `f-/${cleanArchive}/${archNum}`;
-        }
-
-        const TOTAL_PARTS = Math.min(6, Math.max(2, Math.ceil((durationSeconds - 10) / 900)));
-        const rawPartNums = await getNextFileNumberStr(cleanLive, TOTAL_PARTS - 1);
-        const extraNums = Array.isArray(rawPartNums) ? rawPartNums : [rawPartNums];
-        const chainedPlayCommand = [`f-/${cleanArchive}/${archNum}`, ...extraNums.map(n => `f-/${cleanLive}/${n}`)].join('.');
-
-        (async () => {
-            for (let i = 1; i < TOTAL_PARTS; i++) {
-                const startSec = i * 900;
-                const tmpPartMp3 = path.join(os.tmpdir(), `part_${i}_${videoId}_${Date.now()}.mp3`);
-                try {
-                    await downloadSegmentToMp3Fast(videoId, tmpPartMp3, startSec, 900);
-                    if (fs.existsSync(tmpPartMp3)) {
-                        const partBuf = await fs.promises.readFile(tmpPartMp3);
-                        if (partBuf.length > 5000) {
-                            const liveNum = extraNums[i - 1];
-                            await uploadAudioBufferToExactPath(partBuf, `ivr2:/${cleanLive}/${liveNum}.mp3`, `${liveNum}.mp3`, '1', 40000);
-                        }
-                    }
-                } catch (e) {
-                    console.warn(`[Part ${i + 1} Error]`, e.message);
-                } finally {
-                    fs.promises.unlink(tmpPartMp3).catch(() => null);
-                }
-            }
-        })();
-
-        return chainedPlayCommand;
-    } catch (e) {
-        fs.promises.unlink(tmpFirstMp3).catch(() => null);
-        throw e;
+    if (!isLongVideo) {
+        return `f-/${cleanArchive}/${archNum}`;
     }
+
+    const TOTAL_PARTS = Math.min(6, Math.max(2, Math.ceil((durationSeconds - 10) / 900)));
+    const rawPartNums = await getNextFileNumberStr(cleanLive, TOTAL_PARTS - 1);
+    const extraNums = Array.isArray(rawPartNums) ? rawPartNums : [rawPartNums];
+    const chainedPlayCommand = [`f-/${cleanArchive}/${archNum}`, ...extraNums.map(n => `f-/${cleanLive}/${n}`)].join('.');
+
+    // הורדה והעלאה של חלקי ההמשך ברקע
+    (async () => {
+        for (let i = 1; i < TOTAL_PARTS; i++) {
+            const startSec = i * 900;
+            try {
+                const partBuf = await downloadSegmentBufferFast(videoId, startSec, 900);
+                if (partBuf && partBuf.length > 5000) {
+                    const liveNum = extraNums[i - 1];
+                    await uploadAudioBufferToExactPath(partBuf, `ivr2:/${cleanLive}/${liveNum}.mp3`, `${liveNum}.mp3`, '1', 40000);
+                }
+            } catch (e) {
+                console.warn(`[Part ${i + 1} Error]`, e.message);
+            }
+        }
+    })();
+
+    return chainedPlayCommand;
 }
 
 const MAIN_MENU_TEXT = 'ברוכים הבאים לחיפוש ביוטיוב! לשמיעת הפלייליסט שלכם הקישו 1 לשמיעת שיעורי התורה שלכם הקישו 2 לחיפוש מוזיקה חדש הקישו 3 לחיפוש שיעור חדש הקישו 4! שימו לב אם הסרטון ארוך מ 15 דקות הוא עולה בחלקים לשלוחת הפלייליסט או לשלוחת השיעורי תורה ! לחזרה לשלוחה הקודמת הקישו כוכבית! הקו מנוטר משתמש שיחפש תוכן לא ראוי יחסם ';
 
-app.get('/', (req, res) => { res.send('YouTube Personal Line Server v2.0 (RapidAPI /ajax/download.php + Efficient MP3) OK'); });
+app.get('/', (req, res) => { res.send('YouTube Personal Line Server v3.0 (Fast Stream Copy + RapidAPI + Efficient MP3) OK'); });
 
 app.all(['/yemot', '/yemot/:e'], async (req, res) => {
     const q = { ...req.query, ...req.body };
@@ -768,7 +799,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             const ytBaseUrl = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(cleanQuery)}&type=video&maxResults=28`;
             let ytRes, ytData;
             try {
-                const ytResult = await fetchYouTubeWithFallback(ytBaseUrl, 6500);
+                const ytResult = await fetchYouTubeWithFallback(ytBaseUrl, 6000);
                 ytRes = ytResult.res;
                 ytData = ytResult.data;
             } catch (ytFetchErr) {
@@ -794,7 +825,7 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             try {
                 const idsList = validItems.map(v => v.videoId).join(',');
                 const durBaseUrl = `https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id=${encodeURIComponent(idsList)}`;
-                const { res: durRes, data: durData } = await fetchYouTubeWithFallback(durBaseUrl, 5000);
+                const { res: durRes, data: durData } = await fetchYouTubeWithFallback(durBaseUrl, 4500);
                 if (durRes && durRes.ok) {
                     const durMap = new Map();
                     for (const vItem of (durData.items || [])) {
@@ -858,12 +889,13 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
             try { rawName = await transcribeAudio(audioBuf.toString('base64')); } catch (e) {}
             const cleanName = sanitizeForYemotTts(rawName, 40) || 'משתמש רשום';
 
-            await uploadAudioBufferToExactPath(audioBuf, `ivr2:/${userFolder}/name.wav`, 'name.wav', '0');
-            await uploadTextToExactPath(cleanName, `ivr2:/${userFolder}/name.txt`, 'name.txt');
+            await Promise.all([
+                uploadAudioBufferToExactPath(audioBuf, `ivr2:/${userFolder}/name.wav`, 'name.wav', '0'),
+                uploadTextToExactPath(cleanName, `ivr2:/${userFolder}/name.txt`, 'name.txt'),
+                ensurePlayfileExtension(musicExtFolder),
+                ensurePlayfileExtension(torahExtFolder)
+            ]);
             userNamesCache.set(callerPhone, cleanName);
-
-            await ensurePlayfileExtension(musicExtFolder);
-            await ensurePlayfileExtension(torahExtFolder);
             saveAdminLogToExt8(callerPhone, cleanName, 'רישום למערכת', 'הקלטת שם משתמש', '', 'נרשם בהצלחה');
 
             userSessionState.set(callerPhone, { step: 'WAIT_MENU', callId });
@@ -882,5 +914,5 @@ app.all(['/yemot', '/yemot/:e'], async (req, res) => {
 
 const port = process.env.PORT || 3000;
 app.listen(port, '0.0.0.0', () => {
-    console.log(`=== Server v2.0 Ready on port ${port} ===`);
+    console.log(`=== Server v3.0 Ready on port ${port} ===`);
 });
